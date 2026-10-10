@@ -60,6 +60,8 @@ CREATE TABLE IF NOT EXISTS sync_runs (
   items_captured_in_future INTEGER NOT NULL DEFAULT 0,
   snapshots_inserted INTEGER NOT NULL DEFAULT 0,
   snapshots_duplicated INTEGER NOT NULL DEFAULT 0,
+  -- Mesmo (post, captured_at) chegando com números diferentes: vale o primeiro, o conflito fica registrado.
+  snapshot_conflicts INTEGER NOT NULL DEFAULT 0,
   error_code TEXT,
   error_message TEXT,
   retry_at TEXT
@@ -83,7 +85,7 @@ CREATE INDEX IF NOT EXISTS sync_attempts_run ON sync_attempts (sync_run_id, id);
 CREATE TABLE IF NOT EXISTS sync_anomalies (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   sync_run_id TEXT NOT NULL REFERENCES sync_runs (id),
-  kind TEXT NOT NULL CHECK (kind IN ('fora_da_janela', 'captured_at_no_futuro')),
+  kind TEXT NOT NULL CHECK (kind IN ('fora_da_janela', 'captured_at_no_futuro', 'snapshot_conflitante')),
   external_post_id TEXT NOT NULL,
   detail TEXT NOT NULL,
   at TEXT NOT NULL
@@ -113,7 +115,7 @@ export interface ConnectionRow {
   created_at: string;
 }
 
-export type AnomalyKind = "fora_da_janela" | "captured_at_no_futuro";
+export type AnomalyKind = "fora_da_janela" | "captured_at_no_futuro" | "snapshot_conflitante";
 
 export interface Anomaly {
   kind: AnomalyKind;
@@ -138,6 +140,7 @@ export interface SyncRunRow {
   items_captured_in_future: number;
   snapshots_inserted: number;
   snapshots_duplicated: number;
+  snapshot_conflicts: number;
   error_code: string | null;
   error_message: string | null;
   retry_at: string | null;
@@ -238,6 +241,10 @@ export function createRepository(db: DatabaseSync) {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     ),
     bumpAttempts: db.prepare(`UPDATE sync_runs SET attempts = attempts + 1 WHERE id = ?`),
+    snapshotByKey: db.prepare(
+      `SELECT views, likes, comments FROM metric_snapshots
+       WHERE connection_id = ? AND external_post_id = ? AND captured_at = ?`,
+    ),
     insertAnomaly: db.prepare(
       `INSERT INTO sync_anomalies (sync_run_id, kind, external_post_id, detail, at) VALUES (?, ?, ?, ?, ?)`,
     ),
@@ -264,7 +271,8 @@ export function createRepository(db: DatabaseSync) {
     addPageCounters: db.prepare(
       `UPDATE sync_runs SET pages = pages + 1, items_received = items_received + ?,
          items_out_of_window = items_out_of_window + ?, items_captured_in_future = items_captured_in_future + ?,
-         snapshots_inserted = snapshots_inserted + ?, snapshots_duplicated = snapshots_duplicated + ?
+         snapshots_inserted = snapshots_inserted + ?, snapshots_duplicated = snapshots_duplicated + ?,
+         snapshot_conflicts = snapshot_conflicts + ?
        WHERE id = ?`,
     ),
     finishRun: db.prepare(
@@ -352,16 +360,28 @@ export function createRepository(db: DatabaseSync) {
         const outOfWindow = rejected.filter((a) => a.kind === "fora_da_janela").length;
         const inFuture = rejected.filter((a) => a.kind === "captured_at_no_futuro").length;
         let inserted = 0;
+        let conflicts = 0;
         for (const p of posts) {
           stmts.upsertPost.run(connectionId, p.externalId, p.publishedAt, p.caption, fetchedAt, fetchedAt);
           const res = stmts.insertSnapshot.run(
             connectionId, p.externalId, p.capturedAt, p.views, p.likes, p.comments, fetchedAt, runId,
           );
-          inserted += Number(res.changes);
+          if (res.changes === 1) {
+            inserted++;
+            continue;
+          }
+          const kept = stmts.snapshotByKey.get(connectionId, p.externalId, p.capturedAt) as
+            | { views: number; likes: number; comments: number }
+            | undefined;
+          if (kept && (kept.views !== p.views || kept.likes !== p.likes || kept.comments !== p.comments)) {
+            conflicts++;
+            const detail = `captured_at=${p.capturedAt} gravado=${JSON.stringify(kept)} recebido=${JSON.stringify({ views: p.views, likes: p.likes, comments: p.comments })}`;
+            stmts.insertAnomaly.run(runId, "snapshot_conflitante", p.externalId, detail, fetchedAt);
+          }
         }
         const duplicated = posts.length - inserted;
-        stmts.addPageCounters.run(posts.length + rejected.length, outOfWindow, inFuture, inserted, duplicated, runId);
-        return { inserted, duplicated };
+        stmts.addPageCounters.run(posts.length + rejected.length, outOfWindow, inFuture, inserted, duplicated, conflicts, runId);
+        return { inserted, duplicated, conflicts };
       });
     },
 

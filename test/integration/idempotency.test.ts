@@ -157,3 +157,33 @@ describe("quando a métrica foi buscada", () => {
     ]);
   });
 });
+
+describe("mesmo captured_at com números diferentes", () => {
+  it("vale o primeiro e o conflito fica registrado no run", async () => {
+    const h = createHarness();
+    const conn = await h.connect();
+    await h.sync(conn.id);
+    const before = await h.json("GET", `/connections/${conn.id}/metrics`);
+    await h.faults("instagram", "conta-a", [{ type: "metrics_offset", views: 500 }]);
+
+    const res = await h.sync(conn.id);
+
+    // A página 1 (10 posts) voltou com a mesma medição e 500 views a mais.
+    expect(res.body.sync_run).toMatchObject({ status: "succeeded", snapshots_inserted: 0, snapshot_conflicts: 10 });
+    expect(h.snapshotCount()).toBe(30);
+    const after = await h.json("GET", `/connections/${conn.id}/metrics`);
+    expect(after.body.totals).toEqual(before.body.totals);
+    const detail = await h.json("GET", `/sync-runs/${res.body.sync_run.id}`);
+    const conflict = detail.body.anomalies.find((a: any) => a.external_post_id === "instagram-conta-a-p030");
+    expect(conflict.kind).toBe("snapshot_conflitante");
+    expect(conflict.detail).toMatch(/^captured_at=2026-10-01T10:00:00.000Z gravado=\{"views":(\d+),.*\} recebido=\{"views":(\d+),/);
+  });
+
+  it("reenvio idêntico não conta como conflito", async () => {
+    const h = createHarness();
+    const conn = await h.connect();
+    await h.sync(conn.id);
+    const res = await h.sync(conn.id);
+    expect(res.body.sync_run).toMatchObject({ snapshots_duplicated: 33, snapshot_conflicts: 0 });
+  });
+});

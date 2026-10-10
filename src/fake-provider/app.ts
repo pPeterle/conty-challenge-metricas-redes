@@ -21,6 +21,8 @@ const faultSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("out_of_window") }),
   // Devolve a página com captured_at fixo (ex.: 2099), como um provedor com relógio errado.
   z.object({ type: z.literal("captured_at"), value: z.string().datetime({ offset: true }) }),
+  // Mesma medição (mesmo captured_at) com views somadas de `views`: um reenvio inconsistente.
+  z.object({ type: z.literal("metrics_offset"), views: z.number().int() }),
   z.object({ type: z.literal("cursor_loop") }),
 ]);
 export type Fault = z.infer<typeof faultSchema>;
@@ -164,7 +166,7 @@ export function createFakeProviderApp(options: FakeProviderOptions) {
         published_at: new Date(p.publishedAt).toISOString(),
         caption: p.caption,
         captured_at: fault?.type === "captured_at" ? fault.value : new Date(capturedAt).toISOString(),
-        metrics: metricsAt(platform, account, p, capturedAt),
+        metrics: withOffset(metricsAt(platform, account, p, capturedAt), fault),
       })),
       next_cursor: nextCursor,
     });
@@ -202,6 +204,10 @@ export function createFakeProviderApp(options: FakeProviderOptions) {
   });
 
   return app;
+}
+
+function withOffset(m: ReturnType<typeof metricsAt>, fault: Fault | null) {
+  return fault?.type === "metrics_offset" ? { ...m, views: Math.max(0, m.views + fault.views) } : m;
 }
 
 function encodeCursor(offset: number): string {
