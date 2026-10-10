@@ -104,7 +104,7 @@ describe("idempotência do sync", () => {
     expect(new Set(posts.body.posts.map((p: any) => p.captured_at))).toEqual(new Set(["2026-10-01T11:00:00.000Z"]));
   });
 
-  it("syncs concorrentes da mesma conexão com janelas sobrepostas terminam com um snapshot por post", async () => {
+  it("syncs concorrentes da mesma conexão: um roda, os outros recebem 409 sync_em_andamento, e nada duplica", async () => {
     const h = createHarness();
     const conn = await h.connect();
     const windows = [
@@ -117,16 +117,35 @@ describe("idempotência do sync", () => {
 
     const results = await Promise.all([...windows, ...windows].map((w) => h.sync(conn.id, w)));
 
-    expect(results.map((r) => r.status)).toEqual(Array(10).fill(201));
-    const inserted = results.reduce((sum, r) => sum + r.body.sync_run.snapshots_inserted, 0);
-    expect(inserted).toBe(30);
+    expect(results.map((r) => r.status)).toEqual([201, ...Array(9).fill(409)]);
+    for (const r of results.slice(1)) {
+      expect(r.body.error.code).toBe("sync_em_andamento");
+      expect(r.body.running_sync_run_id).toBe(results[0]!.body.sync_run.id);
+    }
+    expect(results[0]!.body.sync_run.snapshots_inserted).toBe(30);
+
+    // Depois que o primeiro termina, as mesmas janelas sobrepostas rodam de novo sem gravar nada.
+    for (const w of windows) {
+      const again = await h.sync(conn.id, w);
+      expect(again.status).toBe(201);
+      expect(again.body.sync_run.snapshots_inserted).toBe(0);
+    }
     expect(h.snapshotCount()).toBe(30);
     const perPost = h.db
       .prepare("SELECT MAX(n) AS max FROM (SELECT COUNT(*) AS n FROM metric_snapshots GROUP BY external_post_id)")
       .get() as { max: number };
     expect(perPost.max).toBe(1);
+    expect(h.db.prepare("SELECT COUNT(*) AS n FROM sync_runs WHERE status = 'running'").get()).toEqual({ n: 0 });
     const metrics = await h.json("GET", `/connections/${conn.id}/metrics`);
     expect(metrics.body.totals).toEqual({ posts: 30, ...(await h.expected("instagram", "conta-a")).totals });
+  });
+
+  it("conexões diferentes sincronizam em paralelo normalmente", async () => {
+    const h = createHarness();
+    const conns = await Promise.all(["a", "b", "c"].map((x) => h.connect({ external_account_id: `conta-${x}` })));
+    const results = await Promise.all(conns.map((c) => h.sync(c.id)));
+    expect(results.map((r) => r.status)).toEqual([201, 201, 201]);
+    expect(h.snapshotCount()).toBe(90);
   });
 });
 

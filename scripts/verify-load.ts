@@ -82,7 +82,7 @@ for (const c of connections) {
       headers: { "content-type": "application/json" },
       body: JSON.stringify(FULL_WINDOW),
     });
-    if (res.status !== 503) break;
+    if (res.status !== 503 && res.status !== 409) break;
     const wait = Number(res.headers.get("retry-after") ?? "1");
     await new Promise((r) => setTimeout(r, wait * 1000 + 50));
   }

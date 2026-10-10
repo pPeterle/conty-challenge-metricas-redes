@@ -69,6 +69,8 @@ CREATE TABLE IF NOT EXISTS sync_runs (
   retry_at TEXT
 );
 CREATE INDEX IF NOT EXISTS sync_runs_connection ON sync_runs (connection_id, started_at);
+-- No máximo um sync em andamento por conexão. Run abandonado é fechado antes de abrir o próximo.
+CREATE UNIQUE INDEX IF NOT EXISTS sync_runs_one_running ON sync_runs (connection_id) WHERE status = 'running';
 
 CREATE TABLE IF NOT EXISTS sync_attempts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -235,6 +237,7 @@ export function createRepository(db: DatabaseSync) {
        VALUES (?, ?, ?, ?, 'running', ?)`,
     ),
     runById: db.prepare(`SELECT * FROM sync_runs WHERE id = ?`),
+    runningRun: db.prepare(`SELECT id FROM sync_runs WHERE connection_id = ? AND status = 'running'`),
     abandonStaleRuns: db.prepare(
       `UPDATE sync_runs SET status = 'failed', finished_at = ?, error_code = 'abandonado',
          error_message = 'execução ficou em running além do limite e foi dada como abandonada'
@@ -354,8 +357,16 @@ export function createRepository(db: DatabaseSync) {
       return Number(stmts.abandonStaleRuns.run(now, connectionId, startedBefore).changes);
     },
 
-    startRun(input: { id: string; connectionId: string; since: string; until: string; startedAt: string }): void {
-      stmts.insertRun.run(input.id, input.connectionId, input.since, input.until, input.startedAt);
+    /** Abre o run. Se já existe um em running para a conexão, devolve o id dele e não abre nada. */
+    startRun(input: { id: string; connectionId: string; since: string; until: string; startedAt: string }): { runningId: string } | null {
+      try {
+        stmts.insertRun.run(input.id, input.connectionId, input.since, input.until, input.startedAt);
+        return null;
+      } catch (error) {
+        if (!/UNIQUE constraint failed: sync_runs\.connection_id/.test(String((error as Error).message))) throw error;
+        const running = stmts.runningRun.get(input.connectionId) as { id: string } | undefined;
+        return { runningId: running?.id ?? "desconhecido" };
+      }
     },
 
     recordAttempt(runId: string, a: SyncAttemptRow): void {

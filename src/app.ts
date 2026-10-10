@@ -18,7 +18,7 @@ import {
   syncWindowSchema,
   type SyncPolicy,
 } from "./schemas.ts";
-import { NeedsReauthError, RateLimitedError, SyncService } from "./sync-service.ts";
+import { NeedsReauthError, RateLimitedError, SyncInProgressError, SyncService } from "./sync-service.ts";
 
 export interface AppDeps {
   db: DatabaseSync;
@@ -160,6 +160,9 @@ export function createApp(deps: AppDeps) {
       try {
         run = await sync.sync(conn, c.req.valid("json"));
       } catch (error) {
+        if (error instanceof SyncInProgressError) {
+          return fail(c, 409, "sync_em_andamento", error.message, { running_sync_run_id: error.runningId });
+        }
         if (error instanceof NeedsReauthError) {
           return fail(c, 409, "reautorizacao_necessaria", error.message);
         }

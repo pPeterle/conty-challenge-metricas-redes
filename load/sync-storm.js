@@ -13,6 +13,7 @@ const DATASET_START = Date.parse("2026-09-01T00:00:00Z");
 const syncSucceeded = new Counter("sync_201_succeeded");
 const syncRateLimited = new Counter("sync_503_rate_limited");
 const syncFailed = new Counter("sync_502_failed");
+const syncBusy = new Counter("sync_409_em_andamento");
 const syncSuccessRate = new Rate("sync_success_rate");
 
 export const options = {
@@ -22,7 +23,7 @@ export const options = {
   },
   thresholds: {
     checks: ["rate>0.99"],
-    sync_success_rate: ["rate>0.7"],
+    sync_success_rate: ["rate>0.9"],
     invalid_payload_rejected_4xx: ["rate==1"],
     // 201 = sync completo; 503 = parou por limite de taxa (comportamento esperado sob 429 longo).
     http_req_failed: ["rate<0.05"],
@@ -32,7 +33,8 @@ export const options = {
 };
 
 // 4xx de payload inválido também é resposta esperada; 5xx nunca é.
-http.setResponseCallback(http.expectedStatuses(200, 201, 400, 404, 413, 415, 503));
+// 409 = já há um sync da mesma conexão em andamento (um por vez, por desenho).
+http.setResponseCallback(http.expectedStatuses(200, 201, 400, 404, 409, 413, 415, 503));
 
 const invalidRejected = new Rate("invalid_payload_rejected_4xx");
 const JSON_HEADERS = { "content-type": "application/json" };
@@ -110,12 +112,20 @@ export function syncStorm(data) {
   if (res.status === 201) syncSucceeded.add(1);
   if (res.status === 503) syncRateLimited.add(1);
   if (res.status === 502) syncFailed.add(1);
-  syncSuccessRate.add(res.status === 201);
+  if (res.status === 409) syncBusy.add(1);
+  // A taxa de sucesso conta só os syncs que de fato abriram um run (a resposta traz sync_run).
+  // 409 (outro sync da conexão em andamento) e 503 sem run (conexão ainda bloqueada) não abrem run.
+  const ranSync = [201, 502, 503].includes(res.status) && res.json("sync_run.id") !== undefined;
+  if (ranSync) syncSuccessRate.add(res.status === 201);
   check(res, {
-    "status é 201, 502 ou 503": (r) => [201, 502, 503].includes(r.status),
+    "status é 201, 409, 502 ou 503": (r) => [201, 409, 502, 503].includes(r.status),
+    "409 é sync_em_andamento": (r) => r.status !== 409 || r.json("error.code") === "sync_em_andamento",
     "201 traz sync_run succeeded": (r) => r.status !== 201 || r.json("sync_run.status") === "succeeded",
     "503 traz retry_at": (r) => r.status !== 503 || typeof r.json("retry_at") === "string",
   });
+  // Cliente educado: com a conexão ocupada ou bloqueada, espera um pouco antes de tentar de novo.
+  if (res.status === 409) sleep(0.2 + Math.random() * 0.3);
+  if (res.status === 503) sleep(Math.min(1, Number(res.headers["Retry-After"] ?? "1")));
 }
 
 export function readMetrics(data) {

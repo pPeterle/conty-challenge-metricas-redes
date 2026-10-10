@@ -29,6 +29,13 @@ export class NeedsReauthError extends Error {
   }
 }
 
+/** Já existe um sync em andamento para a conexão. */
+export class SyncInProgressError extends Error {
+  constructor(readonly runningId: string) {
+    super(`já existe um sync em andamento para esta conexão (sync_run ${runningId})`);
+  }
+}
+
 type PageOutcome =
   | { ok: true; page: ProviderPage }
   | { ok: false; status: "failed" | "rate_limited"; code: string; message: string; retryAt?: string };
@@ -50,13 +57,14 @@ export class SyncService {
     repo.abandonStaleRuns(connection.id, new Date(now.getTime() - this.deps.policy.staleRunMs).toISOString(), now.toISOString());
 
     const runId = newId();
-    repo.startRun({
+    const busy = repo.startRun({
       id: runId,
       connectionId: connection.id,
       since: window.since.toISOString(),
       until: window.until.toISOString(),
       startedAt: now.toISOString(),
     });
+    if (busy) throw new SyncInProgressError(busy.runningId);
 
     try {
       return await this.paginate(runId, connection, window);
