@@ -1,17 +1,23 @@
 // Log estruturado (JSON) com pino. A escrita fica com o transporte `pino/file`, que roda numa
 // worker thread: a thread principal só serializa o objeto e segue atendendo requisições.
-import pino, { type Logger } from "pino";
+import pino, { type DestinationStream, type Logger } from "pino";
 
 export type { Logger };
 
 /** Campos que nunca devem aparecer no log, mesmo que alguém passe o objeto inteiro. */
 const REDACT = ["access_token", "*.access_token", "token", "*.token", "*.authorization", "headers.authorization"];
 
-/** Logger da aplicação. `LOG_LEVEL` define o nível (padrão "info"). */
-export function createLogger(level: string = process.env.LOG_LEVEL ?? "info"): Logger {
+/**
+ * Logger da aplicação. `LOG_LEVEL` define o nível (padrão "info"). Sem `destination`, escreve
+ * no stdout pela worker thread; os testes passam um destino em memória para ler as linhas.
+ */
+export function createLogger(
+  level: string = process.env.LOG_LEVEL ?? "info",
+  destination?: DestinationStream,
+): Logger {
   return pino(
     { level, redact: { paths: REDACT, censor: "[removido]" } },
-    pino.transport({ target: "pino/file", options: { destination: 1 } }),
+    destination ?? pino.transport({ target: "pino/file", options: { destination: 1 } }),
   );
 }
 
