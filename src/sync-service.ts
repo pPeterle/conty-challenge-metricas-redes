@@ -39,6 +39,8 @@ export class SyncService {
       throw new RateLimitedError(connection.rate_limited_until);
     }
 
+    repo.abandonStaleRuns(connection.id, new Date(now.getTime() - this.deps.policy.staleRunMs).toISOString(), now.toISOString());
+
     const runId = newId();
     repo.startRun({
       id: runId,
@@ -65,7 +67,7 @@ export class SyncService {
     const { repo, clock } = this.deps;
     let cursor: string | null = null;
     const seenCursors = new Set<string>();
-    const budget = { waitedMs: 0 };
+    const budget = { waitedMs: 0, attempts: 0 };
 
     for (let pageNumber = 1; ; pageNumber++) {
       if (pageNumber > this.deps.policy.maxPages) {
@@ -97,11 +99,20 @@ export class SyncService {
     window: SyncWindow,
     cursor: string | null,
     page: number,
-    budget: { waitedMs: number },
+    budget: { waitedMs: number; attempts: number },
   ): Promise<PageOutcome> {
     const { provider, clock, sleep, policy, repo } = this.deps;
 
     for (let attempt = 1; ; attempt++) {
+      if (budget.attempts >= policy.maxTotalAttempts) {
+        return {
+          ok: false,
+          status: "failed",
+          code: "provider_unavailable",
+          message: `orçamento de ${policy.maxTotalAttempts} chamadas por sync esgotado`,
+        };
+      }
+      budget.attempts++;
       const response = await provider.fetchPostsPage({
         platform: connection.platform,
         externalAccountId: connection.external_account_id,
@@ -118,7 +129,7 @@ export class SyncService {
       }
 
       const failure = toFailure(response, at);
-      const decision = decideRetry(failure, attempt, policy, budget.waitedMs);
+      const decision = decideRetry(failure, attempt, policy, budget);
       repo.recordAttempt(runId, {
         page,
         attempt,
@@ -146,6 +157,7 @@ export class SyncService {
             : `provedor pediu ${askedMs}ms de espera, acima do teto de ${policy.maxRetryAfterMs}ms`,
           max_attempts: `provedor continuou respondendo 429 depois de ${attempt} tentativas`,
           wait_budget_exceeded: `esperar mais ${askedMs}ms passaria do orçamento de ${policy.maxTotalWaitMs}ms por sync`,
+          attempt_budget_exceeded: `orçamento de ${policy.maxTotalAttempts} chamadas por sync esgotado com o provedor ainda respondendo 429`,
         };
         let message = reasons[decision.reason]!;
         if (blockMs < askedMs) message += `; conexão bloqueada só até ${retryAt} (teto de ${policy.maxRateLimitBlockMs}ms)`;
@@ -154,13 +166,11 @@ export class SyncService {
       if (decision.reason === "permanent") {
         return { ok: false, status: "failed", code: "provider_rejected", message: describe(response) };
       }
-      if (decision.reason === "wait_budget_exceeded") {
-        return {
-          ok: false,
-          status: "failed",
-          code: "provider_unavailable",
-          message: `orçamento de espera de ${policy.maxTotalWaitMs}ms por sync esgotado: ${describe(response)}`,
-        };
+      if (decision.reason === "wait_budget_exceeded" || decision.reason === "attempt_budget_exceeded") {
+        const which = decision.reason === "wait_budget_exceeded"
+          ? `orçamento de espera de ${policy.maxTotalWaitMs}ms por sync`
+          : `orçamento de ${policy.maxTotalAttempts} chamadas por sync`;
+        return { ok: false, status: "failed", code: "provider_unavailable", message: `${which} esgotado: ${describe(response)}` };
       }
       return {
         ok: false,

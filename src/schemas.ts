@@ -122,17 +122,28 @@ export const envSchema = z.object({
   SYNC_BACKOFF_MAX_MS: positiveInt(8_000),
   SYNC_MAX_RETRY_AFTER_MS: positiveInt(30_000),
   SYNC_MAX_TOTAL_WAIT_MS: positiveInt(60_000),
+  SYNC_MAX_TOTAL_ATTEMPTS: positiveInt(300),
+  SYNC_STALE_RUN_MS: positiveInt(15 * 60 * 1000),
   SYNC_MAX_RATE_LIMIT_BLOCK_MS: positiveInt(24 * 3600 * 1000),
   SYNC_MAX_PAGES: positiveInt(100),
 });
 
-export const syncPolicySchema = z.object({
-  maxAttempts: z.number().int().positive().safe(),
-  baseDelayMs: z.number().int().positive().safe(),
-  maxDelayMs: z.number().int().positive().safe(),
-  maxRetryAfterMs: z.number().int().positive().safe(),
-  maxTotalWaitMs: z.number().int().positive().safe(),
-  maxRateLimitBlockMs: z.number().int().positive().safe(),
-  maxPages: z.number().int().positive().safe(),
-});
+const policyInt = z.number().int().positive().safe();
+export const syncPolicySchema = z
+  .object({
+    maxAttempts: policyInt,
+    baseDelayMs: policyInt,
+    maxDelayMs: policyInt,
+    maxRetryAfterMs: policyInt,
+    maxTotalWaitMs: policyInt,
+    maxTotalAttempts: policyInt,
+    maxRateLimitBlockMs: policyInt,
+    maxPages: policyInt,
+    /** Run em running mais velho que isso é considerado abandonado (processo caiu no meio). */
+    staleRunMs: policyInt,
+  })
+  .refine((p) => p.maxTotalAttempts >= p.maxPages, {
+    message: "maxTotalAttempts precisa ser pelo menos maxPages, senão um sync saudável nunca termina",
+    path: ["maxTotalAttempts"],
+  });
 export type SyncPolicy = z.output<typeof syncPolicySchema>;

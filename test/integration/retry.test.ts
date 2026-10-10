@@ -213,3 +213,52 @@ describe("Retry-After hostil", () => {
     expect(() => createHarness({ policy: { maxAttempts: Number.NaN } })).toThrow();
   });
 });
+
+describe("orçamento total por sync", () => {
+  it("teto de chamadas do sync inteiro encerra mesmo com tentativas sobrando na página", async () => {
+    // 4 páginas; cada página pode tentar 4 vezes, mas o sync todo só pode fazer 6 chamadas.
+    const h = createHarness({ policy: { maxAttempts: 4, maxTotalAttempts: 6, maxPages: 4 } });
+    const conn = await h.connect();
+    await h.faults("instagram", "conta-a", [
+      { type: "status", status: 503 },
+      { type: "ok" },
+      { type: "status", status: 503 },
+      { type: "status", status: 503 },
+      { type: "ok" },
+      { type: "status", status: 503 },
+    ]);
+
+    const res = await h.sync(conn.id);
+
+    expect(res.status).toBe(502);
+    expect(res.body.sync_run).toMatchObject({ status: "failed", attempts: 6, pages: 2, error_code: "provider_unavailable" });
+    expect(res.body.error.message).toContain("orçamento de 6 chamadas por sync esgotado");
+    expect(h.providerRequests).toBe(6);
+    expect(h.clock.sleeps).toEqual([100, 100, 200]);
+  });
+
+  it("teto de chamadas com o provedor em 429 termina rate_limited", async () => {
+    const h = createHarness({ policy: { maxAttempts: 10, maxTotalAttempts: 3, maxPages: 1 } });
+    const conn = await h.connect();
+    await h.faults("instagram", "conta-a", Array(5).fill({ type: "status", status: 429, retry_after: "1" }));
+
+    const res = await h.sync(conn.id);
+
+    expect(res.status).toBe(503);
+    expect(res.body.sync_run).toMatchObject({ status: "rate_limited", attempts: 3, retry_at: "2026-10-01T10:15:03.000Z" });
+    expect(h.clock.sleeps).toEqual([S, S]);
+  });
+
+  it("Retry-After 0 não vira loop: continua limitado pelo teto de tentativas", async () => {
+    const h = createHarness({ policy: { maxAttempts: 4 } });
+    const conn = await h.connect();
+    await h.faults("instagram", "conta-a", Array(20).fill({ type: "status", status: 429, retry_after: "0" }));
+
+    const res = await h.sync(conn.id);
+
+    expect(res.status).toBe(503);
+    expect(res.body.sync_run).toMatchObject({ status: "rate_limited", attempts: 4 });
+    expect(h.clock.sleeps).toEqual([0, 0, 0]);
+    expect(h.providerRequests).toBe(4);
+  });
+});

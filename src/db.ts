@@ -202,6 +202,11 @@ export function createRepository(db: DatabaseSync) {
        VALUES (?, ?, ?, ?, 'running', ?)`,
     ),
     runById: db.prepare(`SELECT * FROM sync_runs WHERE id = ?`),
+    abandonStaleRuns: db.prepare(
+      `UPDATE sync_runs SET status = 'failed', finished_at = ?, error_code = 'abandonado',
+         error_message = 'execução ficou em running além do limite e foi dada como abandonada'
+       WHERE connection_id = ? AND status = 'running' AND started_at < ?`,
+    ),
     runsByConnection: db.prepare(`SELECT * FROM sync_runs WHERE connection_id = ? ORDER BY started_at DESC, rowid DESC LIMIT ? OFFSET ?`),
     insertAttempt: db.prepare(
       `INSERT INTO sync_attempts (sync_run_id, page, attempt, outcome, http_status, detail, wait_ms, at)
@@ -287,6 +292,11 @@ export function createRepository(db: DatabaseSync) {
 
     markRateLimited(connectionId: string, until: string): void {
       stmts.setRateLimitedUntil.run(until, connectionId, until);
+    },
+
+    /** Fecha runs que ficaram em running (processo caiu no meio). Devolve quantos foram fechados. */
+    abandonStaleRuns(connectionId: string, startedBefore: string, now: string): number {
+      return Number(stmts.abandonStaleRuns.run(now, connectionId, startedBefore).changes);
     },
 
     startRun(input: { id: string; connectionId: string; since: string; until: string; startedAt: string }): void {

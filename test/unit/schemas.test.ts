@@ -37,6 +37,8 @@ describe("configuração", () => {
       maxDelayMs: 1,
       maxRetryAfterMs: 10,
       maxTotalWaitMs: 10,
+      maxTotalAttempts: 10,
+      staleRunMs: 10,
       maxRateLimitBlockMs: 10,
       maxPages: 1,
     };

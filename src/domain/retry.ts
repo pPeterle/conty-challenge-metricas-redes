@@ -4,16 +4,30 @@ import type { SyncPolicy } from "../schemas.ts";
  * maxAttempts: teto de tentativas por página (a primeira chamada conta).
  * baseDelayMs/maxDelayMs: backoff exponencial das falhas transitórias.
  * maxRetryAfterMs: maior Retry-After que aceitamos esperar; acima disso o sync para.
- * maxTotalWaitMs: orçamento de espera somada de um sync inteiro.
+ * maxTotalWaitMs / maxTotalAttempts: orçamento de espera somada e de chamadas de um sync inteiro.
  */
-export type RetryPolicy = Pick<SyncPolicy, "maxAttempts" | "baseDelayMs" | "maxDelayMs" | "maxRetryAfterMs" | "maxTotalWaitMs">;
+export type RetryPolicy = Pick<
+  SyncPolicy,
+  "maxAttempts" | "baseDelayMs" | "maxDelayMs" | "maxRetryAfterMs" | "maxTotalWaitMs" | "maxTotalAttempts"
+>;
+
+/** O que o sync inteiro já gastou: espera somada e chamadas feitas (inclusive a que acabou de falhar). */
+export interface SyncSpend {
+  waitedMs: number;
+  attempts: number;
+}
 
 export type AttemptFailure =
   | { kind: "transient"; reason: string }
   | { kind: "rate_limited"; retryAfterMs: number | null }
   | { kind: "permanent"; reason: string };
 
-export type GiveUpReason = "permanent" | "max_attempts" | "retry_after_above_cap" | "wait_budget_exceeded";
+export type GiveUpReason =
+  | "permanent"
+  | "max_attempts"
+  | "retry_after_above_cap"
+  | "wait_budget_exceeded"
+  | "attempt_budget_exceeded";
 
 export type RetryDecision =
   | { action: "retry"; waitMs: number }
@@ -57,10 +71,17 @@ export function parseRetryAfterMs(value: string | null | undefined, now: Date): 
 }
 
 /**
- * Decide o que fazer depois de uma tentativa que falhou. `waitedMs` é quanto o sync já esperou
- * no total; a próxima espera não pode estourar `maxTotalWaitMs`.
+ * Decide o que fazer depois de uma tentativa que falhou. `attempt` conta só a página atual;
+ * `spent` é o gasto do sync inteiro, que não pode estourar os orçamentos.
  */
-export function decideRetry(failure: AttemptFailure, attempt: number, policy: RetryPolicy, waitedMs = 0): RetryDecision {
+export function decideRetry(
+  failure: AttemptFailure,
+  attempt: number,
+  policy: RetryPolicy,
+  spent: SyncSpend = { waitedMs: 0, attempts: attempt },
+): RetryDecision {
+  const { waitedMs } = spent;
+  const attemptsLeft = spent.attempts < policy.maxTotalAttempts;
   if (failure.kind === "permanent") {
     return { action: "give_up", status: "failed", reason: "permanent" };
   }
@@ -71,12 +92,16 @@ export function decideRetry(failure: AttemptFailure, attempt: number, policy: Re
     const giveUp = (reason: GiveUpReason): RetryDecision => ({ action: "give_up", status: "rate_limited", reason, retryAfterMs: waitMs });
     if (waitMs > policy.maxRetryAfterMs) return giveUp("retry_after_above_cap");
     if (attempt >= policy.maxAttempts) return giveUp("max_attempts");
+    if (!attemptsLeft) return giveUp("attempt_budget_exceeded");
     if (waitedMs + waitMs > policy.maxTotalWaitMs) return giveUp("wait_budget_exceeded");
     return { action: "retry", waitMs };
   }
 
   if (attempt >= policy.maxAttempts) {
     return { action: "give_up", status: "failed", reason: "max_attempts" };
+  }
+  if (!attemptsLeft) {
+    return { action: "give_up", status: "failed", reason: "attempt_budget_exceeded" };
   }
   const waitMs = backoffDelayMs(attempt, policy);
   if (waitedMs + waitMs > policy.maxTotalWaitMs) {

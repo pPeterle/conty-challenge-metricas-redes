@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { backoffDelayMs, decideRetry, MAX_PARSED_RETRY_AFTER_MS, parseRetryAfterMs, type RetryPolicy } from "../../src/domain/retry.ts";
 
-const policy: RetryPolicy = { maxAttempts: 4, baseDelayMs: 100, maxDelayMs: 500, maxRetryAfterMs: 10_000, maxTotalWaitMs: 60_000 };
+const policy: RetryPolicy = { maxAttempts: 4, baseDelayMs: 100, maxDelayMs: 500, maxRetryAfterMs: 10_000, maxTotalWaitMs: 60_000, maxTotalAttempts: 100 };
 const now = new Date("2026-10-01T12:00:00.000Z");
 
 describe("parseRetryAfterMs", () => {
@@ -52,18 +52,27 @@ describe("parseRetryAfterMs com valores hostis", () => {
 describe("orçamento total de espera", () => {
   it("falha transitória para quando a próxima espera estoura o orçamento", () => {
     const tight = { ...policy, maxTotalWaitMs: 250 };
-    expect(decideRetry({ kind: "transient", reason: "503" }, 2, tight, 100)).toEqual({ action: "give_up", status: "failed", reason: "wait_budget_exceeded" });
-    expect(decideRetry({ kind: "transient", reason: "503" }, 2, tight, 50)).toEqual({ action: "retry", waitMs: 200 });
+    expect(decideRetry({ kind: "transient", reason: "503" }, 2, tight, { waitedMs: 100, attempts: 2 })).toEqual({ action: "give_up", status: "failed", reason: "wait_budget_exceeded" });
+    expect(decideRetry({ kind: "transient", reason: "503" }, 2, tight, { waitedMs: 50, attempts: 2 })).toEqual({ action: "retry", waitMs: 200 });
   });
 
   it("429 que estoura o orçamento termina rate_limited sem esperar", () => {
     const tight = { ...policy, maxTotalWaitMs: 2_500 };
-    expect(decideRetry({ kind: "rate_limited", retryAfterMs: 1_000 }, 3, tight, 2_000)).toEqual({
+    expect(decideRetry({ kind: "rate_limited", retryAfterMs: 1_000 }, 3, tight, { waitedMs: 2_000, attempts: 3 })).toEqual({
       action: "give_up",
       status: "rate_limited",
       reason: "wait_budget_exceeded",
       retryAfterMs: 1_000,
     });
+  });
+});
+
+describe("orçamento total de tentativas", () => {
+  it("para quando o sync inteiro chegou ao teto de chamadas, mesmo com tentativas sobrando na página", () => {
+    const tight = { ...policy, maxTotalAttempts: 10 };
+    const spent = { waitedMs: 0, attempts: 10 };
+    expect(decideRetry({ kind: "transient", reason: "503" }, 1, tight, spent)).toEqual({ action: "give_up", status: "failed", reason: "attempt_budget_exceeded" });
+    expect(decideRetry({ kind: "rate_limited", retryAfterMs: 0 }, 1, tight, spent)).toMatchObject({ status: "rate_limited", reason: "attempt_budget_exceeded" });
   });
 });
 

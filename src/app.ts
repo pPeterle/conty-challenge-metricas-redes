@@ -34,6 +34,8 @@ export const DEFAULT_POLICY: SyncPolicy = {
   maxDelayMs: 8_000,
   maxRetryAfterMs: 30_000,
   maxTotalWaitMs: 60_000,
+  maxTotalAttempts: 300,
+  staleRunMs: 15 * 60 * 1000,
   maxRateLimitBlockMs: 24 * 3600 * 1000,
   maxPages: 100,
 };

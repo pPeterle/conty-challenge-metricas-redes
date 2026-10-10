@@ -27,6 +27,8 @@ const app = createApp({
     maxDelayMs: env.SYNC_BACKOFF_MAX_MS,
     maxRetryAfterMs: env.SYNC_MAX_RETRY_AFTER_MS,
     maxTotalWaitMs: env.SYNC_MAX_TOTAL_WAIT_MS,
+    maxTotalAttempts: env.SYNC_MAX_TOTAL_ATTEMPTS,
+    staleRunMs: env.SYNC_STALE_RUN_MS,
     maxRateLimitBlockMs: env.SYNC_MAX_RATE_LIMIT_BLOCK_MS,
     maxPages: env.SYNC_MAX_PAGES,
   },
