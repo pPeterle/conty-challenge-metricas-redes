@@ -171,3 +171,45 @@ describe("429 e Retry-After", () => {
     expect(h.clock.sleeps).toEqual([100, 200]);
   });
 });
+
+describe("Retry-After hostil", () => {
+  it.each(["99999999999999", "9".repeat(400), "86400000", "Fri, 31 Dec 9999 23:59:59 GMT"])(
+    "Retry-After %s termina rate_limited, não deixa o run em running e bloqueia no máximo 24h",
+    async (retryAfter) => {
+      const h = createHarness();
+      const conn = await h.connect();
+      await h.faults("instagram", "conta-a", [{ type: "status", status: 429, retry_after: retryAfter }]);
+
+      const res = await h.sync(conn.id);
+
+      expect(res.status).toBe(503);
+      expect(res.body.sync_run).toMatchObject({ status: "rate_limited", retry_at: "2026-10-02T10:15:00.000Z" });
+      expect(res.body.sync_run.finished_at).not.toBeNull();
+      expect(res.headers.get("retry-after")).toBe("86400");
+      const detail = await h.json("GET", `/sync-runs/${res.body.sync_run.id}`);
+      expect(detail.body.attempts[0].detail).toBe(`429 com Retry-After=${retryAfter.slice(0, 100)}`);
+      const c = await h.json("GET", `/connections/${conn.id}`);
+      expect(c.body.connection.rate_limited_until).toBe("2026-10-02T10:15:00.000Z");
+
+      h.clock.advance(24 * 3600 * 1000);
+      expect((await h.sync(conn.id)).status).toBe(201);
+    },
+  );
+
+  it("orçamento total de espera por sync encerra como rate_limited em vez de esperar de novo", async () => {
+    const h = createHarness({ policy: { maxAttempts: 10, maxTotalWaitMs: 2_500 } });
+    const conn = await h.connect();
+    await h.faults("instagram", "conta-a", Array(5).fill({ type: "status", status: 429, retry_after: "1" }));
+
+    const res = await h.sync(conn.id);
+
+    expect(res.status).toBe(503);
+    expect(h.clock.sleeps).toEqual([S, S]);
+    expect(res.body.sync_run).toMatchObject({ status: "rate_limited", attempts: 3 });
+    expect(res.body.error.message).toContain("orçamento de 2500ms");
+  });
+
+  it("política com teto inválido nem cria a aplicação", () => {
+    expect(() => createHarness({ policy: { maxAttempts: Number.NaN } })).toThrow();
+  });
+});

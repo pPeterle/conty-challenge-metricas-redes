@@ -14,6 +14,8 @@ export const TEST_POLICY: SyncPolicy = {
   baseDelayMs: 100,
   maxDelayMs: 1_000,
   maxRetryAfterMs: 10_000,
+  maxTotalWaitMs: 60_000,
+  maxRateLimitBlockMs: 24 * 3600 * 1000,
   maxPages: 20,
 };
 

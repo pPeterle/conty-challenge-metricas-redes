@@ -1,13 +1,10 @@
 import type { Clock, Sleep } from "./clock.ts";
 import type { ConnectionRow, Repository, SyncRunRow } from "./db.ts";
-import { decideRetry, parseRetryAfterMs, type AttemptFailure, type RetryPolicy } from "./domain/retry.ts";
-import type { SyncWindow } from "./domain/window.ts";
+import { decideRetry, MAX_PARSED_RETRY_AFTER_MS, parseRetryAfterMs, type AttemptFailure } from "./domain/retry.ts";
 import type { ProviderClient, ProviderPage, ProviderResponse } from "./provider/types.ts";
+import { syncPolicySchema, type SyncPolicy, type SyncWindow } from "./schemas.ts";
 
-export interface SyncPolicy extends RetryPolicy {
-  /** Proteção contra paginação sem fim. */
-  maxPages: number;
-}
+export type { SyncPolicy };
 
 export interface SyncServiceDeps {
   repo: Repository;
@@ -30,7 +27,10 @@ type PageOutcome =
   | { ok: false; status: "failed" | "rate_limited"; code: string; message: string; retryAt?: string };
 
 export class SyncService {
-  constructor(private readonly deps: SyncServiceDeps) {}
+  constructor(private readonly deps: SyncServiceDeps) {
+    // Teto NaN ou negativo desligaria o limite de tentativas: falha já na construção.
+    syncPolicySchema.parse(deps.policy);
+  }
 
   async sync(connection: ConnectionRow, window: SyncWindow): Promise<SyncRunRow> {
     const { repo, clock, newId } = this.deps;
@@ -48,15 +48,31 @@ export class SyncService {
       startedAt: now.toISOString(),
     });
 
+    try {
+      return await this.paginate(runId, connection, window);
+    } catch (error) {
+      // Não deixa a execução presa em running quando algo inesperado quebra no meio.
+      try {
+        this.finish(runId, "failed", "internal_error", "erro interno durante o sync");
+      } catch {
+        // o banco também pode ser a causa; o erro original é o que importa
+      }
+      throw error;
+    }
+  }
+
+  private async paginate(runId: string, connection: ConnectionRow, window: SyncWindow): Promise<SyncRunRow> {
+    const { repo, clock } = this.deps;
     let cursor: string | null = null;
     const seenCursors = new Set<string>();
+    const budget = { waitedMs: 0 };
 
     for (let pageNumber = 1; ; pageNumber++) {
       if (pageNumber > this.deps.policy.maxPages) {
         return this.finish(runId, "failed", "too_many_pages", `paginação passou do limite de ${this.deps.policy.maxPages} páginas`);
       }
 
-      const outcome = await this.fetchPageWithRetry(runId, connection, window, cursor, pageNumber);
+      const outcome = await this.fetchPageWithRetry(runId, connection, window, cursor, pageNumber, budget);
       if (!outcome.ok) {
         if (outcome.retryAt) repo.markRateLimited(connection.id, outcome.retryAt);
         return this.finish(runId, outcome.status, outcome.code, outcome.message, outcome.retryAt);
@@ -81,6 +97,7 @@ export class SyncService {
     window: SyncWindow,
     cursor: string | null,
     page: number,
+    budget: { waitedMs: number },
   ): Promise<PageOutcome> {
     const { provider, clock, sleep, policy, repo } = this.deps;
 
@@ -101,7 +118,7 @@ export class SyncService {
       }
 
       const failure = toFailure(response, at);
-      const decision = decideRetry(failure, attempt, policy);
+      const decision = decideRetry(failure, attempt, policy, budget.waitedMs);
       repo.recordAttempt(runId, {
         page,
         attempt,
@@ -113,19 +130,37 @@ export class SyncService {
       });
 
       if (decision.action === "retry") {
+        budget.waitedMs += decision.waitMs;
         await sleep(decision.waitMs);
         continue;
       }
 
       if (decision.status === "rate_limited") {
-        const retryAt = new Date(at.getTime() + (decision.retryAfterMs ?? 0)).toISOString();
-        const message = decision.reason === "retry_after_above_cap"
-          ? `provedor pediu ${decision.retryAfterMs}ms de espera, acima do teto de ${policy.maxRetryAfterMs}ms`
-          : `provedor continuou respondendo 429 depois de ${attempt} tentativas`;
+        const askedMs = decision.retryAfterMs ?? 0;
+        // Um Retry-After absurdo (dias, anos) não pode travar a conexão para sempre.
+        const blockMs = Math.min(askedMs, policy.maxRateLimitBlockMs);
+        const retryAt = new Date(at.getTime() + blockMs).toISOString();
+        const reasons: Record<string, string> = {
+          retry_after_above_cap: askedMs >= MAX_PARSED_RETRY_AFTER_MS
+            ? `provedor pediu um ano ou mais de espera, acima do teto de ${policy.maxRetryAfterMs}ms`
+            : `provedor pediu ${askedMs}ms de espera, acima do teto de ${policy.maxRetryAfterMs}ms`,
+          max_attempts: `provedor continuou respondendo 429 depois de ${attempt} tentativas`,
+          wait_budget_exceeded: `esperar mais ${askedMs}ms passaria do orçamento de ${policy.maxTotalWaitMs}ms por sync`,
+        };
+        let message = reasons[decision.reason]!;
+        if (blockMs < askedMs) message += `; conexão bloqueada só até ${retryAt} (teto de ${policy.maxRateLimitBlockMs}ms)`;
         return { ok: false, status: "rate_limited", code: "provider_rate_limited", message, retryAt };
       }
       if (decision.reason === "permanent") {
         return { ok: false, status: "failed", code: "provider_rejected", message: describe(response) };
+      }
+      if (decision.reason === "wait_budget_exceeded") {
+        return {
+          ok: false,
+          status: "failed",
+          code: "provider_unavailable",
+          message: `orçamento de espera de ${policy.maxTotalWaitMs}ms por sync esgotado: ${describe(response)}`,
+        };
       }
       return {
         ok: false,
@@ -160,6 +195,6 @@ function toFailure(response: Exclude<ProviderResponse, { kind: "ok" }>, now: Dat
 }
 
 function describe(response: Exclude<ProviderResponse, { kind: "ok" }>): string {
-  if (response.kind === "rate_limited") return `429 com Retry-After=${response.retryAfter ?? "(ausente)"}`;
-  return response.reason;
+  if (response.kind === "rate_limited") return `429 com Retry-After=${response.retryAfter?.slice(0, 100) ?? "(ausente)"}`;
+  return response.reason.slice(0, 300);
 }

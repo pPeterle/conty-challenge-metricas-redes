@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { backoffDelayMs, decideRetry, parseRetryAfterMs, type RetryPolicy } from "../../src/domain/retry.ts";
+import { backoffDelayMs, decideRetry, MAX_PARSED_RETRY_AFTER_MS, parseRetryAfterMs, type RetryPolicy } from "../../src/domain/retry.ts";
 
-const policy: RetryPolicy = { maxAttempts: 4, baseDelayMs: 100, maxDelayMs: 500, maxRetryAfterMs: 10_000 };
+const policy: RetryPolicy = { maxAttempts: 4, baseDelayMs: 100, maxDelayMs: 500, maxRetryAfterMs: 10_000, maxTotalWaitMs: 60_000 };
 const now = new Date("2026-10-01T12:00:00.000Z");
 
 describe("parseRetryAfterMs", () => {
@@ -23,6 +23,47 @@ describe("parseRetryAfterMs", () => {
     expect(parseRetryAfterMs("", now)).toBeNull();
     expect(parseRetryAfterMs("logo mais", now)).toBeNull();
     expect(parseRetryAfterMs("-5", now)).toBeNull();
+  });
+});
+
+describe("parseRetryAfterMs com valores hostis", () => {
+  it.each(["1.5", "+5", "-1", "1e3", "5s", "0x10", "Thu, 31 Feb 2026 12:00:00 GMT", "Xxx, 01 Oct 2026 12:00:30 GMT",
+    "Wed, 01 Oct 2026 12:00:30 GMT", "Thursday, 01-Oct-26 12:00:30 GMT", "Thu Oct  1 12:00:30 2026"])(
+    "%s é inválido",
+    (value) => {
+      expect(parseRetryAfterMs(value, now)).toBeNull();
+    },
+  );
+
+  it("zeros à esquerda são segundos normais", () => {
+    expect(parseRetryAfterMs("007", now)).toBe(7_000);
+  });
+
+  it.each(["99999999999999", "9".repeat(400), "Fri, 31 Dec 9999 23:59:59 GMT"])(
+    "valor enorme (%s) vira um número finito, limitado a um ano",
+    (value) => {
+      const ms = parseRetryAfterMs(value.length > 40 ? value : value, now);
+      expect(ms).toBe(MAX_PARSED_RETRY_AFTER_MS);
+      expect(Number.isFinite(ms)).toBe(true);
+    },
+  );
+});
+
+describe("orçamento total de espera", () => {
+  it("falha transitória para quando a próxima espera estoura o orçamento", () => {
+    const tight = { ...policy, maxTotalWaitMs: 250 };
+    expect(decideRetry({ kind: "transient", reason: "503" }, 2, tight, 100)).toEqual({ action: "give_up", status: "failed", reason: "wait_budget_exceeded" });
+    expect(decideRetry({ kind: "transient", reason: "503" }, 2, tight, 50)).toEqual({ action: "retry", waitMs: 200 });
+  });
+
+  it("429 que estoura o orçamento termina rate_limited sem esperar", () => {
+    const tight = { ...policy, maxTotalWaitMs: 2_500 };
+    expect(decideRetry({ kind: "rate_limited", retryAfterMs: 1_000 }, 3, tight, 2_000)).toEqual({
+      action: "give_up",
+      status: "rate_limited",
+      reason: "wait_budget_exceeded",
+      retryAfterMs: 1_000,
+    });
   });
 });
 

@@ -1,51 +1,66 @@
-export interface RetryPolicy {
-  /** Teto de tentativas por página (a primeira chamada conta). */
-  maxAttempts: number;
-  /** Primeira espera do backoff exponencial. */
-  baseDelayMs: number;
-  /** Maior espera do backoff exponencial. */
-  maxDelayMs: number;
-  /** Maior Retry-After que aceitamos esperar dentro de um sync. Acima disso o sync para. */
-  maxRetryAfterMs: number;
-}
+import type { SyncPolicy } from "../schemas.ts";
+
+/**
+ * maxAttempts: teto de tentativas por página (a primeira chamada conta).
+ * baseDelayMs/maxDelayMs: backoff exponencial das falhas transitórias.
+ * maxRetryAfterMs: maior Retry-After que aceitamos esperar; acima disso o sync para.
+ * maxTotalWaitMs: orçamento de espera somada de um sync inteiro.
+ */
+export type RetryPolicy = Pick<SyncPolicy, "maxAttempts" | "baseDelayMs" | "maxDelayMs" | "maxRetryAfterMs" | "maxTotalWaitMs">;
 
 export type AttemptFailure =
   | { kind: "transient"; reason: string }
   | { kind: "rate_limited"; retryAfterMs: number | null }
   | { kind: "permanent"; reason: string };
 
+export type GiveUpReason = "permanent" | "max_attempts" | "retry_after_above_cap" | "wait_budget_exceeded";
+
 export type RetryDecision =
   | { action: "retry"; waitMs: number }
   | {
       action: "give_up";
       status: "failed" | "rate_limited";
-      reason: "permanent" | "max_attempts" | "retry_after_above_cap";
+      reason: GiveUpReason;
       /** Só em rate_limited: quanto o provedor pediu para esperar. */
       retryAfterMs?: number;
     };
 
+/** Teto do que o parse devolve. Garante número finito para somar a datas sem estourar. */
+export const MAX_PARSED_RETRY_AFTER_MS = 365 * 24 * 3600 * 1000;
+
 /** Espera depois da tentativa `attempt` (1 = primeira) que falhou de forma transitória. */
 export function backoffDelayMs(attempt: number, policy: RetryPolicy): number {
-  return Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** (attempt - 1));
+  return Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** Math.min(attempt - 1, 30));
 }
 
+const IMF_FIXDATE = /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+
 /**
- * Interpreta o header Retry-After (RFC 9110): inteiro de segundos ou HTTP-date.
- * Devolve null quando o header falta ou é inválido.
+ * Interpreta o header Retry-After (RFC 9110): inteiro de segundos ou HTTP-date no formato
+ * IMF-fixdate. Devolve null quando o header falta ou é inválido. O resultado nunca passa de
+ * MAX_PARSED_RETRY_AFTER_MS.
  */
 export function parseRetryAfterMs(value: string | null | undefined, now: Date): number | null {
   if (value == null) return null;
   const trimmed = value.trim();
   if (trimmed === "") return null;
-  if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1000;
-  // Só o formato IMF-fixdate ("Thu, 01 Oct 2026 12:00:30 GMT"); Date.parse sozinho aceita até "-5".
-  if (!/^[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(trimmed)) return null;
+  if (/^\d+$/.test(trimmed)) {
+    // Mais de 12 dígitos já passa de um ano em segundos; evita Number("9".repeat(400)) = Infinity.
+    const ms = trimmed.length > 12 ? Infinity : Number(trimmed) * 1000;
+    return Math.min(ms, MAX_PARSED_RETRY_AFTER_MS);
+  }
+  if (!IMF_FIXDATE.test(trimmed)) return null;
   const at = Date.parse(trimmed);
-  if (Number.isNaN(at)) return null;
-  return Math.max(0, at - now.getTime());
+  // A volta para texto recusa data impossível (31 Feb) e dia da semana errado.
+  if (Number.isNaN(at) || new Date(at).toUTCString() !== trimmed) return null;
+  return Math.min(Math.max(0, at - now.getTime()), MAX_PARSED_RETRY_AFTER_MS);
 }
 
-export function decideRetry(failure: AttemptFailure, attempt: number, policy: RetryPolicy): RetryDecision {
+/**
+ * Decide o que fazer depois de uma tentativa que falhou. `waitedMs` é quanto o sync já esperou
+ * no total; a próxima espera não pode estourar `maxTotalWaitMs`.
+ */
+export function decideRetry(failure: AttemptFailure, attempt: number, policy: RetryPolicy, waitedMs = 0): RetryDecision {
   if (failure.kind === "permanent") {
     return { action: "give_up", status: "failed", reason: "permanent" };
   }
@@ -53,17 +68,19 @@ export function decideRetry(failure: AttemptFailure, attempt: number, policy: Re
   if (failure.kind === "rate_limited") {
     // Sem Retry-After válido, cai no mesmo backoff das falhas transitórias.
     const waitMs = failure.retryAfterMs ?? backoffDelayMs(attempt, policy);
-    if (waitMs > policy.maxRetryAfterMs) {
-      return { action: "give_up", status: "rate_limited", reason: "retry_after_above_cap", retryAfterMs: waitMs };
-    }
-    if (attempt >= policy.maxAttempts) {
-      return { action: "give_up", status: "rate_limited", reason: "max_attempts", retryAfterMs: waitMs };
-    }
+    const giveUp = (reason: GiveUpReason): RetryDecision => ({ action: "give_up", status: "rate_limited", reason, retryAfterMs: waitMs });
+    if (waitMs > policy.maxRetryAfterMs) return giveUp("retry_after_above_cap");
+    if (attempt >= policy.maxAttempts) return giveUp("max_attempts");
+    if (waitedMs + waitMs > policy.maxTotalWaitMs) return giveUp("wait_budget_exceeded");
     return { action: "retry", waitMs };
   }
 
   if (attempt >= policy.maxAttempts) {
     return { action: "give_up", status: "failed", reason: "max_attempts" };
   }
-  return { action: "retry", waitMs: backoffDelayMs(attempt, policy) };
+  const waitMs = backoffDelayMs(attempt, policy);
+  if (waitedMs + waitMs > policy.maxTotalWaitMs) {
+    return { action: "give_up", status: "failed", reason: "wait_budget_exceeded" };
+  }
+  return { action: "retry", waitMs };
 }
