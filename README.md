@@ -183,25 +183,25 @@ Com várias instâncias, eu mudaria nesta ordem:
 
 Depois, `scripts/verify-load.ts` lê o banco e a API e falha se: existir snapshot repetido; algum post tiver mais de um snapshot; algum número gravado divergir do provedor; sobrar sync em `running`; existir conexão além das 20 do setup (um payload inválido teria gravado). Em seguida ele desliga o chaos, faz um sync final de cada conexão e compara os totais de cada conexão e de cada criador com o que o provedor diz.
 
-Resultado real de uma execução local, no código final (macOS, k6 0.54.0 no Docker):
+Resultado real de uma execução nesta máquina, no código final (macOS, k6 0.54.0 no Docker, 2026-10-10):
 
 ```
-✓ checks.........................: 100.00% 32251 out of 32251
-✓ { scenario:reads }...........: avg=1.88ms   med=859.21µs p(90)=3.46ms   p(95)=6.32ms
-✓ { scenario:syncs }...........: avg=120.22ms med=2.56ms   p(90)=156.27ms p(95)=1.05s
-✓ http_req_failed................: 0.00%   0 out of 12997
-  http_reqs......................: 12997   407.483195/s
-✓ invalid_payload_rejected_4xx...: 100.00% 1026 out of 1026
-  sync_201_succeeded.............: 7567
-  sync_503_rate_limited..........: 1557
-✓ sync_success_rate..............: 82.93%  7567 out of 9124
-provedor durante a carga: {"200":12670,"429":788,"503":1545,"requests":15294,"duplicate_items":3060,"timeout":291}
-sync_runs: [{"status":"rate_limited","n":31,"attempts":58},{"status":"succeeded","n":7567,"attempts":15236}]
+✓ checks.........................: 100.00% 33153 out of 33153
+✓ { scenario:reads }...........: avg=1.17ms   med=846.96µs p(90)=1.69ms   p(95)=2.41ms
+✓ { scenario:syncs }...........: avg=116.91ms med=1.56ms   p(90)=153.36ms p(95)=1.01s
+✓ http_req_failed................: 0.00%   0 out of 13314
+  http_reqs......................: 13314   419.568971/s
+✓ invalid_payload_rejected_4xx...: 100.00% 1041 out of 1041
+  sync_201_succeeded.............: 7802
+  sync_503_rate_limited..........: 1607
+✓ sync_success_rate..............: 82.92%  7802 out of 9409
+provedor durante a carga: {"200":13034,"429":810,"503":1584,"requests":15727,"duplicate_items":3140,"timeout":299}
+sync_runs: [{"status":"rate_limited","n":33,"attempts":55},{"status":"succeeded","n":7802,"attempts":15672}]
 conexões: 20, snapshots durante a carga: 600, depois do sync final: 600 snapshots para 600 posts
 verificação ok: nenhum snapshot duplicado, números iguais aos do provedor, totais conferem
 ```
 
-O p95 de 1,05 s dos syncs vem quase todo da espera de `Retry-After: 1`; a mediana fica em 2,56 ms. Das 1557 respostas 503, 31 vieram de syncs que receberam um 429 acima do teto ou esgotaram as tentativas. As outras foram syncs recusados sem chamar o provedor, porque a conexão ainda estava dentro do `retry_at`. Nesta execução nenhum sync terminou `failed`; em outras, apareceu um 502 isolado quando uma página pegou 6 falhas transitórias seguidas, o que o teto permite. 4xx e 503 contam como resposta esperada em `http_req_failed`, e a taxa de sucesso dos syncs tem threshold próprio (`> 0.7`). Rodei a carga seis vezes com a semente fixa enquanto fazia as últimas mudanças, e a taxa ficou entre 82,9% e 85,9%. A semente repete a sequência de falhas sorteadas, mas a ordem das requisições muda entre execuções, então o número exato também muda um pouco.
+O p95 de 1,01 s dos syncs vem quase todo da espera de `Retry-After: 1`; a mediana fica em 1,56 ms. Das 1607 respostas 503, 33 vieram de syncs que receberam um 429 acima do teto ou esgotaram as tentativas. As outras foram syncs recusados sem chamar o provedor, porque a conexão ainda estava dentro do `retry_at`. Nesta execução nenhum sync terminou `failed`; em outras, apareceu um 502 isolado quando uma página pegou 6 falhas transitórias seguidas, o que o teto permite. 4xx e 503 contam como resposta esperada em `http_req_failed`, e a taxa de sucesso dos syncs tem threshold próprio (`> 0.7`). Os tetos de latência são folgados de propósito para a carga passar em máquinas mais lentas: p95 abaixo de 5 s nos syncs, que esperam `Retry-After` dentro da requisição, e abaixo de 500 ms nas leituras. Checks, payload inválido recusado (`rate==1`), taxa de erro e a verificação no banco continuam rígidos. Rodei a carga seis vezes com a semente fixa enquanto fazia as últimas mudanças, e a taxa ficou entre 82,9% e 85,9%. A semente repete a sequência de falhas sorteadas, mas a ordem das requisições muda entre execuções, então o número exato também muda um pouco.
 
 ## O que ficou de fora
 

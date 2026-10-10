@@ -26,8 +26,8 @@ export const options = {
     invalid_payload_rejected_4xx: ["rate==1"],
     // 201 = sync completo; 503 = parou por limite de taxa (comportamento esperado sob 429 longo).
     http_req_failed: ["rate<0.05"],
-    "http_req_duration{scenario:syncs}": ["p(95)<3000"],
-    "http_req_duration{scenario:reads}": ["p(95)<300"],
+    "http_req_duration{scenario:syncs}": ["p(95)<5000"],
+    "http_req_duration{scenario:reads}": ["p(95)<500"],
   },
 };
 
