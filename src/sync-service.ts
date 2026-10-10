@@ -1,7 +1,7 @@
 import type { Clock, Sleep } from "./clock.ts";
-import type { ConnectionRow, Repository, SyncRunRow } from "./db.ts";
+import type { Anomaly, ConnectionRow, Repository, SyncRunRow } from "./db.ts";
 import { decideRetry, MAX_PARSED_RETRY_AFTER_MS, parseRetryAfterMs, type AttemptFailure } from "./domain/retry.ts";
-import type { ProviderClient, ProviderPage, ProviderResponse } from "./provider/types.ts";
+import type { ProviderClient, ProviderPage, ProviderPost, ProviderResponse } from "./provider/types.ts";
 import { syncPolicySchema, type SyncPolicy, type SyncWindow } from "./schemas.ts";
 
 export type { SyncPolicy };
@@ -80,16 +80,10 @@ export class SyncService {
         return this.finish(runId, outcome.status, outcome.code, outcome.message, outcome.retryAt);
       }
 
-      // Post fora da janela pedida é anomalia do provedor: não grava, só conta no run.
-      const since = window.since.getTime();
-      const until = window.until.getTime();
-      const inWindow = outcome.page.posts.filter((p) => {
-        const at = Date.parse(p.publishedAt);
-        return at >= since && at < until;
-      });
-      const outOfWindow = outcome.page.posts.length - inWindow.length;
       // fetched_at é o relógio da nossa busca; captured_at vem do provedor dentro de cada post.
-      repo.ingestPage(runId, connection.id, inWindow, clock.now().toISOString(), outOfWindow);
+      const fetchedAt = clock.now();
+      const { accepted, rejected } = screenPosts(outcome.page.posts, window, fetchedAt, this.deps.policy.maxFutureSkewMs);
+      repo.ingestPage(runId, connection.id, accepted, fetchedAt.toISOString(), rejected);
 
       const next = outcome.page.nextCursor;
       if (next === null) return this.finish(runId, "succeeded");
@@ -203,6 +197,30 @@ export class SyncService {
     });
     return this.deps.repo.getRun(runId)!;
   }
+}
+
+/**
+ * Separa o que o provedor mandou e não pode virar métrica: post publicado fora da janela pedida e
+ * medição com captured_at à frente do nosso relógio. Uma medição "de 2099" viraria a atual para
+ * sempre (a atual é a de maior captured_at) e esconderia todas as medições reais seguintes.
+ */
+export function screenPosts(posts: ProviderPost[], window: SyncWindow, now: Date, maxFutureSkewMs: number) {
+  const since = window.since.getTime();
+  const until = window.until.getTime();
+  const latestAllowed = now.getTime() + maxFutureSkewMs;
+  const accepted: ProviderPost[] = [];
+  const rejected: Anomaly[] = [];
+  for (const p of posts) {
+    const published = Date.parse(p.publishedAt);
+    if (published < since || published >= until) {
+      rejected.push({ kind: "fora_da_janela", externalPostId: p.externalId, detail: `published_at=${p.publishedAt}` });
+    } else if (Date.parse(p.capturedAt) > latestAllowed) {
+      rejected.push({ kind: "captured_at_no_futuro", externalPostId: p.externalId, detail: `captured_at=${p.capturedAt}` });
+    } else {
+      accepted.push(p);
+    }
+  }
+  return { accepted, rejected };
 }
 
 function toFailure(response: Exclude<ProviderResponse, { kind: "ok" }>, now: Date): AttemptFailure {

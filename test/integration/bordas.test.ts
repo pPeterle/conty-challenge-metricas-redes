@@ -148,3 +148,39 @@ describe("datas estritas", () => {
     expect(count(h, "metric_snapshots")).toBe(0);
   });
 });
+
+describe("captured_at no futuro", () => {
+  it("medição datada muito à frente do relógio não vira a atual e as medições reais seguintes valem", async () => {
+    const h = createHarness({ policy: { maxFutureSkewMs: 5 * 60 * 1000 } });
+    const conn = await h.connect();
+    await h.faults("instagram", "conta-a", [{ type: "captured_at", value: "2099-01-01T00:00:00Z" }]);
+
+    const first = await h.sync(conn.id);
+
+    // A primeira página (10 posts) veio com captured_at de 2099: nada dela é gravado. Entram os 20
+    // posts das outras páginas mais o p021, que se repete no começo da página 2 com a medição real.
+    expect(first.body.sync_run).toMatchObject({ status: "succeeded", items_captured_in_future: 10, snapshots_inserted: 21 });
+    const detail = await h.json("GET", `/sync-runs/${first.body.sync_run.id}`);
+    expect(detail.body.anomalies).toHaveLength(10);
+    expect(detail.body.anomalies[0]).toMatchObject({ kind: "captured_at_no_futuro", detail: "captured_at=2099-01-01T00:00:00.000Z" });
+    expect(h.db.prepare("SELECT COUNT(*) AS n FROM metric_snapshots WHERE captured_at > '2027'").get()).toEqual({ n: 0 });
+
+    // Uma hora depois o provedor volta ao normal: a medição real é a atual de todos os posts.
+    h.clock.advance(60 * 60 * 1000);
+    await h.sync(conn.id);
+    const metrics = await h.json("GET", `/connections/${conn.id}/metrics`);
+    expect(metrics.body.totals).toEqual({ posts: 30, ...(await h.expected("instagram", "conta-a")).totals });
+  });
+
+  it("captured_at dentro da tolerância é aceito", async () => {
+    const h = createHarness({ policy: { maxFutureSkewMs: 5 * 60 * 1000 } });
+    const conn = await h.connect();
+    // Relógio da API em 10:15; o provedor diz que mediu às 10:19, 4 min à frente.
+    await h.faults("instagram", "conta-a", [{ type: "captured_at", value: "2026-10-01T10:19:00Z" }]);
+
+    const res = await h.sync(conn.id);
+
+    // 30 posts, mais o p021 repetido na página 2 com a medição das 10:00: outra medição, outro snapshot.
+    expect(res.body.sync_run).toMatchObject({ items_captured_in_future: 0, snapshots_inserted: 31 });
+  });
+});

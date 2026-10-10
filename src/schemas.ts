@@ -160,6 +160,7 @@ export const envSchema = z.object({
   SYNC_MAX_TOTAL_WAIT_MS: positiveInt(60_000),
   SYNC_MAX_TOTAL_ATTEMPTS: positiveInt(300),
   SYNC_STALE_RUN_MS: positiveInt(15 * 60 * 1000),
+  SYNC_MAX_FUTURE_SKEW_MS: positiveInt(5 * 60 * 1000),
   SYNC_MAX_RATE_LIMIT_BLOCK_MS: positiveInt(24 * 3600 * 1000),
   SYNC_MAX_PAGES: positiveInt(100),
 });
@@ -177,6 +178,8 @@ export const syncPolicySchema = z
     maxPages: policyInt,
     /** Run em running mais velho que isso é considerado abandonado (processo caiu no meio). */
     staleRunMs: policyInt,
+    /** Tolerância para captured_at à frente do nosso relógio (relógios nunca batem exatamente). */
+    maxFutureSkewMs: policyInt,
   })
   .refine((p) => p.maxTotalAttempts >= p.maxPages, {
     message: "maxTotalAttempts precisa ser pelo menos maxPages, senão um sync saudável nunca termina",

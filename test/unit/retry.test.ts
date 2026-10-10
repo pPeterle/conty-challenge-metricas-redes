@@ -142,3 +142,27 @@ describe("decideRetry", () => {
     });
   });
 });
+
+describe("screenPosts", () => {
+  it("separa post fora da janela e captured_at além da tolerância", async () => {
+    const { screenPosts } = await import("../../src/sync-service.ts");
+    const base = { caption: null, views: 1, likes: 0, comments: 0 };
+    const window = { since: new Date("2026-09-01T00:00:00Z"), until: new Date("2026-09-02T00:00:00Z") };
+    const now = new Date("2026-10-01T12:00:00Z");
+    const { accepted, rejected } = screenPosts(
+      [
+        { ...base, externalId: "ok", publishedAt: "2026-09-01T10:00:00.000Z", capturedAt: "2026-10-01T12:05:00.000Z" },
+        { ...base, externalId: "futuro", publishedAt: "2026-09-01T10:00:00.000Z", capturedAt: "2026-10-01T12:05:00.001Z" },
+        { ...base, externalId: "fora", publishedAt: "2026-09-02T00:00:00.000Z", capturedAt: "2026-10-01T12:00:00.000Z" },
+      ],
+      window,
+      now,
+      5 * 60 * 1000,
+    );
+    expect(accepted.map((p) => p.externalId)).toEqual(["ok"]);
+    expect(rejected.map((a) => [a.kind, a.externalPostId])).toEqual([
+      ["captured_at_no_futuro", "futuro"],
+      ["fora_da_janela", "fora"],
+    ]);
+  });
+});

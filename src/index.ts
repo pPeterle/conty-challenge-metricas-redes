@@ -29,6 +29,7 @@ const app = createApp({
     maxTotalWaitMs: env.SYNC_MAX_TOTAL_WAIT_MS,
     maxTotalAttempts: env.SYNC_MAX_TOTAL_ATTEMPTS,
     staleRunMs: env.SYNC_STALE_RUN_MS,
+    maxFutureSkewMs: env.SYNC_MAX_FUTURE_SKEW_MS,
     maxRateLimitBlockMs: env.SYNC_MAX_RATE_LIMIT_BLOCK_MS,
     maxPages: env.SYNC_MAX_PAGES,
   },

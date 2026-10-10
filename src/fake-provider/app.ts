@@ -19,6 +19,8 @@ const faultSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("slow"), delay_ms: z.number().int().positive().max(120_000) }),
   // Acrescenta à página um post publicado fora da janela pedida.
   z.object({ type: z.literal("out_of_window") }),
+  // Devolve a página com captured_at fixo (ex.: 2099), como um provedor com relógio errado.
+  z.object({ type: z.literal("captured_at"), value: z.string().datetime({ offset: true }) }),
   z.object({ type: z.literal("cursor_loop") }),
 ]);
 export type Fault = z.infer<typeof faultSchema>;
@@ -161,7 +163,7 @@ export function createFakeProviderApp(options: FakeProviderOptions) {
         id: p.id,
         published_at: new Date(p.publishedAt).toISOString(),
         caption: p.caption,
-        captured_at: new Date(capturedAt).toISOString(),
+        captured_at: fault?.type === "captured_at" ? fault.value : new Date(capturedAt).toISOString(),
         metrics: metricsAt(platform, account, p, capturedAt),
       })),
       next_cursor: nextCursor,

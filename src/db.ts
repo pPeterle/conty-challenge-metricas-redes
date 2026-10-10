@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS sync_runs (
   items_received INTEGER NOT NULL DEFAULT 0,
   -- Posts que o provedor devolveu com published_at fora da janela pedida: descartados.
   items_out_of_window INTEGER NOT NULL DEFAULT 0,
+  -- Posts com captured_at à frente do nosso relógio além da tolerância: descartados.
+  items_captured_in_future INTEGER NOT NULL DEFAULT 0,
   snapshots_inserted INTEGER NOT NULL DEFAULT 0,
   snapshots_duplicated INTEGER NOT NULL DEFAULT 0,
   error_code TEXT,
@@ -76,6 +78,17 @@ CREATE TABLE IF NOT EXISTS sync_attempts (
   at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS sync_attempts_run ON sync_attempts (sync_run_id, id);
+
+-- O que o sync recusou ou estranhou no que o provedor mandou, item a item.
+CREATE TABLE IF NOT EXISTS sync_anomalies (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  sync_run_id TEXT NOT NULL REFERENCES sync_runs (id),
+  kind TEXT NOT NULL CHECK (kind IN ('fora_da_janela', 'captured_at_no_futuro')),
+  external_post_id TEXT NOT NULL,
+  detail TEXT NOT NULL,
+  at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS sync_anomalies_run ON sync_anomalies (sync_run_id, id);
 `;
 
 export function openDatabase(path: string): DatabaseSync {
@@ -100,6 +113,14 @@ export interface ConnectionRow {
   created_at: string;
 }
 
+export type AnomalyKind = "fora_da_janela" | "captured_at_no_futuro";
+
+export interface Anomaly {
+  kind: AnomalyKind;
+  externalPostId: string;
+  detail: string;
+}
+
 export type SyncStatus = "running" | "succeeded" | "failed" | "rate_limited";
 
 export interface SyncRunRow {
@@ -114,6 +135,7 @@ export interface SyncRunRow {
   pages: number;
   items_received: number;
   items_out_of_window: number;
+  items_captured_in_future: number;
   snapshots_inserted: number;
   snapshots_duplicated: number;
   error_code: string | null;
@@ -216,6 +238,12 @@ export function createRepository(db: DatabaseSync) {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     ),
     bumpAttempts: db.prepare(`UPDATE sync_runs SET attempts = attempts + 1 WHERE id = ?`),
+    insertAnomaly: db.prepare(
+      `INSERT INTO sync_anomalies (sync_run_id, kind, external_post_id, detail, at) VALUES (?, ?, ?, ?, ?)`,
+    ),
+    anomaliesByRun: db.prepare(
+      `SELECT kind, external_post_id, detail, at FROM sync_anomalies WHERE sync_run_id = ? ORDER BY id LIMIT 200`,
+    ),
     attemptsByRun: db.prepare(
       `SELECT page, attempt, outcome, http_status, detail, wait_ms, at FROM sync_attempts WHERE sync_run_id = ? ORDER BY id`,
     ),
@@ -235,7 +263,8 @@ export function createRepository(db: DatabaseSync) {
     ),
     addPageCounters: db.prepare(
       `UPDATE sync_runs SET pages = pages + 1, items_received = items_received + ?,
-         items_out_of_window = items_out_of_window + ?, snapshots_inserted = snapshots_inserted + ?, snapshots_duplicated = snapshots_duplicated + ?
+         items_out_of_window = items_out_of_window + ?, items_captured_in_future = items_captured_in_future + ?,
+         snapshots_inserted = snapshots_inserted + ?, snapshots_duplicated = snapshots_duplicated + ?
        WHERE id = ?`,
     ),
     finishRun: db.prepare(
@@ -317,8 +346,11 @@ export function createRepository(db: DatabaseSync) {
      * Grava uma página inteira numa transação. Snapshot repetido (mesmo post e mesmo captured_at,
      * vindo de página sobreposta, janela sobreposta ou sync concorrente) é ignorado pelo ON CONFLICT.
      */
-    ingestPage(runId: string, connectionId: string, posts: ProviderPost[], fetchedAt: string, outOfWindow = 0) {
+    ingestPage(runId: string, connectionId: string, posts: ProviderPost[], fetchedAt: string, rejected: Anomaly[] = []) {
       return transaction(() => {
+        for (const a of rejected) stmts.insertAnomaly.run(runId, a.kind, a.externalPostId, a.detail, fetchedAt);
+        const outOfWindow = rejected.filter((a) => a.kind === "fora_da_janela").length;
+        const inFuture = rejected.filter((a) => a.kind === "captured_at_no_futuro").length;
         let inserted = 0;
         for (const p of posts) {
           stmts.upsertPost.run(connectionId, p.externalId, p.publishedAt, p.caption, fetchedAt, fetchedAt);
@@ -328,7 +360,7 @@ export function createRepository(db: DatabaseSync) {
           inserted += Number(res.changes);
         }
         const duplicated = posts.length - inserted;
-        stmts.addPageCounters.run(posts.length + outOfWindow, outOfWindow, inserted, duplicated, runId);
+        stmts.addPageCounters.run(posts.length + rejected.length, outOfWindow, inFuture, inserted, duplicated, runId);
         return { inserted, duplicated };
       });
     },
@@ -343,6 +375,10 @@ export function createRepository(db: DatabaseSync) {
 
     listRuns(connectionId: string, limit = 50, offset = 0): SyncRunRow[] {
       return stmts.runsByConnection.all(connectionId, limit, offset) as unknown as SyncRunRow[];
+    },
+
+    listAnomalies(runId: string): Array<{ kind: AnomalyKind; external_post_id: string; detail: string; at: string }> {
+      return stmts.anomaliesByRun.all(runId) as unknown as Array<{ kind: AnomalyKind; external_post_id: string; detail: string; at: string }>;
     },
 
     listAttempts(runId: string): SyncAttemptRow[] {

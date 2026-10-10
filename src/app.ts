@@ -36,6 +36,7 @@ export const DEFAULT_POLICY: SyncPolicy = {
   maxTotalWaitMs: 60_000,
   maxTotalAttempts: 300,
   staleRunMs: 15 * 60 * 1000,
+  maxFutureSkewMs: 5 * 60 * 1000,
   maxRateLimitBlockMs: 24 * 3600 * 1000,
   maxPages: 100,
 };
@@ -177,7 +178,7 @@ export function createApp(deps: AppDeps) {
   app.get("/sync-runs/:id", validate("param", connectionParamsSchema), (c) => {
     const run = repo.getRun(c.req.valid("param").id);
     if (!run) return fail(c, 404, "sync_run_not_found", "execução de sync não encontrada");
-    return c.json({ sync_run: run, attempts: repo.listAttempts(run.id) });
+    return c.json({ sync_run: run, attempts: repo.listAttempts(run.id), anomalies: repo.listAnomalies(run.id) });
   });
 
   app.get("/connections/:id/posts", validate("param", connectionParamsSchema), validate("query", paginationSchema(100)), (c) => {
