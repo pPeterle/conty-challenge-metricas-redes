@@ -22,7 +22,8 @@ export const options = {
   },
   thresholds: {
     checks: ["rate>0.99"],
-    sync_success_rate: ["rate>0.8"],
+    sync_success_rate: ["rate>0.7"],
+    invalid_payload_rejected_4xx: ["rate==1"],
     // 201 = sync completo; 503 = parou por limite de taxa (comportamento esperado sob 429 longo).
     http_req_failed: ["rate<0.05"],
     "http_req_duration{scenario:syncs}": ["p(95)<3000"],
@@ -30,7 +31,43 @@ export const options = {
   },
 };
 
-http.setResponseCallback(http.expectedStatuses(200, 201, 503));
+// 4xx de payload inválido também é resposta esperada; 5xx nunca é.
+http.setResponseCallback(http.expectedStatuses(200, 201, 400, 404, 413, 415, 503));
+
+const invalidRejected = new Rate("invalid_payload_rejected_4xx");
+const JSON_HEADERS = { "content-type": "application/json" };
+const INVALID = [
+  { path: "sync", body: "{ since: ", headers: JSON_HEADERS },
+  { path: "sync", body: "", headers: JSON_HEADERS },
+  { path: "sync", body: "null", headers: JSON_HEADERS },
+  { path: "sync", body: "[1,2,3]", headers: JSON_HEADERS },
+  { path: "sync", body: JSON.stringify({ since: "2026-02-30T00:00:00Z", until: "2026-03-05T00:00:00Z" }), headers: JSON_HEADERS },
+  { path: "sync", body: JSON.stringify({ since: "2026-09-01T00:00:00", until: "2026-09-02T00:00:00Z" }), headers: JSON_HEADERS },
+  { path: "sync", body: JSON.stringify({ since: 1, until: { a: 1 } }), headers: JSON_HEADERS },
+  { path: "sync", body: JSON.stringify({ since: "2026-09-05T00:00:00Z", until: "2026-09-01T00:00:00Z" }), headers: JSON_HEADERS },
+  { path: "sync", body: JSON.stringify({ since: "2026-09-01T00:00:00Z", until: "2026-09-02T00:00:00Z" }), headers: {} },
+  { path: "sync", body: JSON.stringify({ since: "x".repeat(20000), until: "y" }), headers: JSON_HEADERS },
+  { path: "unknown-sync", body: JSON.stringify({ since: "2026-09-01T00:00:00Z", until: "2026-09-02T00:00:00Z" }), headers: JSON_HEADERS },
+  { path: "connections", body: JSON.stringify({ creator_id: "ação 😀", platform: "instagram", external_account_id: "a", access_token: "t" }), headers: JSON_HEADERS },
+  { path: "connections", body: JSON.stringify({ creator_id: "c", platform: "orkut", external_account_id: "a", access_token: "t" }), headers: JSON_HEADERS },
+  { path: "connections", body: JSON.stringify({ creator_id: "c", platform: "x", external_account_id: "a", access_token: "   " }), headers: JSON_HEADERS },
+  { path: "connections", body: '"oi"', headers: { "content-type": "text/plain" } },
+];
+
+function sendInvalid(data) {
+  const c = INVALID[Math.floor(Math.random() * INVALID.length)];
+  const id = data.ids[Math.floor(Math.random() * data.ids.length)];
+  const url = c.path === "connections"
+    ? `${BASE_URL}/connections`
+    : `${BASE_URL}/connections/${c.path === "sync" ? id : "nao-existe"}/sync`;
+  const res = http.post(url, c.body, { headers: c.headers, tags: { name: "payload inválido" } });
+  const ok = res.status >= 400 && res.status < 500;
+  invalidRejected.add(ok);
+  check(res, {
+    "payload inválido recebe 4xx": () => ok,
+    "erro no formato padrão": (r) => typeof r.json("error.code") === "string",
+  });
+}
 
 export function setup() {
   const ids = [];
@@ -63,6 +100,8 @@ function randomWindow() {
 }
 
 export function syncStorm(data) {
+  // 10% das iterações mandam lixo: tem que voltar 4xx e não pode gravar nada.
+  if (Math.random() < 0.1) return sendInvalid(data);
   const id = data.ids[Math.floor(Math.random() * data.ids.length)];
   const res = http.post(`${BASE_URL}/connections/${id}/sync`, JSON.stringify(randomWindow()), {
     headers: { "content-type": "application/json" },

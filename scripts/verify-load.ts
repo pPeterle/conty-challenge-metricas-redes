@@ -48,6 +48,8 @@ const connections = db.prepare("SELECT id, creator_id, platform, external_accoun
   platform: string;
   external_account_id: string;
 }>;
+// Os payloads inválidos da carga não podem ter criado conexão nenhuma além das 20 do setup.
+if (connections.length !== 20) fail(`esperava 20 conexões, achei ${connections.length}`);
 const snapshotsDuringLoad = (db.prepare("SELECT COUNT(*) AS n FROM metric_snapshots").get() as { n: number }).n;
 const lookup = db.prepare(
   "SELECT external_post_id, views, likes, comments FROM metric_snapshots WHERE connection_id = ?",
@@ -65,7 +67,12 @@ for (const c of connections) {
 }
 
 // 3. Sem chaos, um sync final de cada conexão e os totais da API batem com o provedor.
-await fetch(`${PROVIDER_URL}/__admin/chaos`, { method: "PUT", body: JSON.stringify({ enabled: false }) });
+const chaosOff = await fetch(`${PROVIDER_URL}/__admin/chaos`, {
+  method: "PUT",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ enabled: false }),
+});
+if (!chaosOff.ok) fail(`não consegui desligar o chaos do provedor (${chaosOff.status})`);
 const creatorExpected = new Map<string, { posts: number; views: number; likes: number; comments: number }>();
 for (const c of connections) {
   let res: Response | undefined;

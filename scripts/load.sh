@@ -20,7 +20,7 @@ trap cleanup EXIT
 # Relógio do provedor congelado: cada post tem exatamente uma medição durante a carga.
 PROVIDER_PORT="$PROVIDER_PORT" PROVIDER_FIXED_NOW="2026-10-01T12:30:00Z" PROVIDER_CHAOS=1 \
 CHAOS_5XX=0.1 CHAOS_429=0.05 CHAOS_RETRY_AFTER=1 CHAOS_LONG_429=0.002 CHAOS_LONG_RETRY_AFTER=3 \
-CHAOS_TIMEOUT=0.02 CHAOS_TIMEOUT_HANG_MS=3000 CHAOS_DUPLICATE=0.2 \
+CHAOS_TIMEOUT=0.02 CHAOS_TIMEOUT_HANG_MS=3000 CHAOS_DUPLICATE=0.2 CHAOS_SEED=42 \
   npx tsx src/fake-provider/server.ts > "$WORK/provider.log" 2>&1 &
 PROVIDER_PID=$!
 
@@ -48,6 +48,7 @@ API_URL="http://localhost:$API_PORT" PROVIDER_URL="http://localhost:$PROVIDER_PO
 
 if [[ $K6_STATUS -ne 0 || $VERIFY_STATUS -ne 0 ]]; then
   echo "carga falhou (k6=$K6_STATUS, verificação=$VERIFY_STATUS)"
-  echo "--- api.log (fim)"; tail -n 30 "$WORK/api.log"
+  mkdir -p .load && cp "$WORK"/*.log .load/ 2>/dev/null || true
+  echo "--- api.log (fim; logs completos em .load/)"; tail -n 30 "$WORK/api.log"
   exit 1
 fi
