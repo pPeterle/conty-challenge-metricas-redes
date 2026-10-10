@@ -80,8 +80,16 @@ export class SyncService {
         return this.finish(runId, outcome.status, outcome.code, outcome.message, outcome.retryAt);
       }
 
+      // Post fora da janela pedida é anomalia do provedor: não grava, só conta no run.
+      const since = window.since.getTime();
+      const until = window.until.getTime();
+      const inWindow = outcome.page.posts.filter((p) => {
+        const at = Date.parse(p.publishedAt);
+        return at >= since && at < until;
+      });
+      const outOfWindow = outcome.page.posts.length - inWindow.length;
       // fetched_at é o relógio da nossa busca; captured_at vem do provedor dentro de cada post.
-      repo.ingestPage(runId, connection.id, outcome.page.posts, clock.now().toISOString());
+      repo.ingestPage(runId, connection.id, inWindow, clock.now().toISOString(), outOfWindow);
 
       const next = outcome.page.nextCursor;
       if (next === null) return this.finish(runId, "succeeded");

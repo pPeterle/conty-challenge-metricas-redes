@@ -15,6 +15,10 @@ const faultSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("status"), status: z.number().int().min(400).max(599), retry_after: z.string().max(1_000).optional() }),
   z.object({ type: z.literal("timeout"), hang_ms: z.number().int().positive().max(120_000).optional() }),
   z.object({ type: z.literal("duplicate_items") }),
+  // Responde certo, mas só depois de delay_ms, ignorando o cancelamento do cliente.
+  z.object({ type: z.literal("slow"), delay_ms: z.number().int().positive().max(120_000) }),
+  // Acrescenta à página um post publicado fora da janela pedida.
+  z.object({ type: z.literal("out_of_window") }),
   z.object({ type: z.literal("cursor_loop") }),
 ]);
 export type Fault = z.infer<typeof faultSchema>;
@@ -119,6 +123,11 @@ export function createFakeProviderApp(options: FakeProviderOptions) {
       return c.json({ error: "too_late" }, 504);
     }
 
+    if (fault?.type === "slow") {
+      count("slow");
+      await new Promise((resolve) => setTimeout(resolve, fault.delay_ms));
+    }
+
     const now = options.clock.now();
     const capturedAt = capturedAtFor(now);
     const visible = listPosts(platform, account, dataset)
@@ -140,6 +149,10 @@ export function createFakeProviderApp(options: FakeProviderOptions) {
     if (fault?.type === "duplicate_items") {
       count("duplicate_items");
       items = [...items, ...items];
+    }
+    if (fault?.type === "out_of_window") {
+      count("out_of_window");
+      items = [...items, { id: `${platform}-${account}-fora`, publishedAt: Date.parse("2020-01-01T00:00:00Z"), caption: "fora da janela" }];
     }
 
     count("200");

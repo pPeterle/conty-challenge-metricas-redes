@@ -3,6 +3,7 @@ import { ManualClock } from "../../src/clock.ts";
 import { openDatabase } from "../../src/db.ts";
 import { createFakeProviderApp, type Fault } from "../../src/fake-provider/app.ts";
 import { HttpProviderClient } from "../../src/provider/http-client.ts";
+import type { ProviderClient } from "../../src/provider/types.ts";
 import type { SyncPolicy } from "../../src/sync-service.ts";
 
 export const START = "2026-10-01T10:15:00.000Z";
@@ -25,7 +26,9 @@ export const TEST_POLICY: SyncPolicy = {
  * API + provedor simulado no mesmo processo. A API fala com o provedor pelo cliente HTTP real;
  * só o transporte é trocado por `providerApp.request`, então não abre porta nenhuma.
  */
-export function createHarness(overrides: { policy?: Partial<SyncPolicy>; timeoutMs?: number } = {}) {
+export function createHarness(
+  overrides: { policy?: Partial<SyncPolicy>; timeoutMs?: number; provider?: ProviderClient } = {},
+) {
   const clock = new ManualClock(START);
   const providerApp = createFakeProviderApp({ clock, pageSize: 10, overlapPages: true });
   let providerRequests = 0;
@@ -42,7 +45,7 @@ export function createHarness(overrides: { policy?: Partial<SyncPolicy>; timeout
     db,
     clock,
     sleep: clock.sleep,
-    provider,
+    provider: overrides.provider ?? provider,
     policy: { ...TEST_POLICY, ...overrides.policy },
   };
   const app = createApp(deps);

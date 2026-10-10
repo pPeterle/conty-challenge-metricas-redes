@@ -54,6 +54,8 @@ CREATE TABLE IF NOT EXISTS sync_runs (
   attempts INTEGER NOT NULL DEFAULT 0,
   pages INTEGER NOT NULL DEFAULT 0,
   items_received INTEGER NOT NULL DEFAULT 0,
+  -- Posts que o provedor devolveu com published_at fora da janela pedida: descartados.
+  items_out_of_window INTEGER NOT NULL DEFAULT 0,
   snapshots_inserted INTEGER NOT NULL DEFAULT 0,
   snapshots_duplicated INTEGER NOT NULL DEFAULT 0,
   error_code TEXT,
@@ -111,6 +113,7 @@ export interface SyncRunRow {
   attempts: number;
   pages: number;
   items_received: number;
+  items_out_of_window: number;
   snapshots_inserted: number;
   snapshots_duplicated: number;
   error_code: string | null;
@@ -232,7 +235,7 @@ export function createRepository(db: DatabaseSync) {
     ),
     addPageCounters: db.prepare(
       `UPDATE sync_runs SET pages = pages + 1, items_received = items_received + ?,
-         snapshots_inserted = snapshots_inserted + ?, snapshots_duplicated = snapshots_duplicated + ?
+         items_out_of_window = items_out_of_window + ?, snapshots_inserted = snapshots_inserted + ?, snapshots_duplicated = snapshots_duplicated + ?
        WHERE id = ?`,
     ),
     finishRun: db.prepare(
@@ -314,7 +317,7 @@ export function createRepository(db: DatabaseSync) {
      * Grava uma página inteira numa transação. Snapshot repetido (mesmo post e mesmo captured_at,
      * vindo de página sobreposta, janela sobreposta ou sync concorrente) é ignorado pelo ON CONFLICT.
      */
-    ingestPage(runId: string, connectionId: string, posts: ProviderPost[], fetchedAt: string) {
+    ingestPage(runId: string, connectionId: string, posts: ProviderPost[], fetchedAt: string, outOfWindow = 0) {
       return transaction(() => {
         let inserted = 0;
         for (const p of posts) {
@@ -325,7 +328,7 @@ export function createRepository(db: DatabaseSync) {
           inserted += Number(res.changes);
         }
         const duplicated = posts.length - inserted;
-        stmts.addPageCounters.run(posts.length, inserted, duplicated, runId);
+        stmts.addPageCounters.run(posts.length + outOfWindow, outOfWindow, inserted, duplicated, runId);
         return { inserted, duplicated };
       });
     },
