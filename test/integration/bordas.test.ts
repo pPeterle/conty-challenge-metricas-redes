@@ -149,6 +149,28 @@ describe("datas estritas", () => {
   });
 });
 
+describe("fuso impossível", () => {
+  it.each(["+24:00", "+23:60", "-15:00"])("captured_at com fuso %s vindo do provedor é recusado como fora do contrato", async (offset) => {
+    const h = createHarness();
+    const conn = await h.connect();
+    await h.faults("instagram", "conta-a", [{ type: "captured_at", value: `2026-10-01T10:00:00${offset}` }]);
+    const res = await h.sync(conn.id);
+    expect(res.status).toBe(502);
+    expect(res.body.sync_run).toMatchObject({ status: "failed", error_code: "provider_rejected" });
+    expect(count(h, "metric_snapshots")).toBe(0);
+  });
+
+  it.each(["+24:00", "+99:00", "-15:00"])("o provedor simulado recusa since com fuso %s em vez de devolver página vazia", async (offset) => {
+    const { createFakeProviderApp } = await import("../../src/fake-provider/app.ts");
+    const provider = createFakeProviderApp({ clock: { now: () => new Date("2026-10-01T10:00:00Z") } });
+    const since = encodeURIComponent(`2026-09-01T00:00:00${offset}`);
+    const res = await provider.request(`/v1/instagram/accounts/a/posts?since=${since}&until=2026-09-09T00:00:00Z`, {
+      headers: { authorization: "Bearer x" },
+    });
+    expect(res.status).toBe(400);
+  });
+});
+
 describe("captured_at no futuro", () => {
   it("medição datada muito à frente do relógio não vira a atual e as medições reais seguintes valem", async () => {
     const h = createHarness({ policy: { maxFutureSkewMs: 5 * 60 * 1000 } });

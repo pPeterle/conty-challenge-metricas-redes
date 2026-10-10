@@ -2,6 +2,7 @@ import { zValidator } from "@hono/zod-validator";
 import { Hono } from "hono";
 import { z } from "zod";
 import type { Clock } from "../clock.ts";
+import { isExactInstant } from "../schemas.ts";
 import { capturedAtFor, DEFAULT_DATASET, listPosts, metricsAt, type DatasetOptions } from "./dataset.ts";
 
 /**
@@ -47,9 +48,11 @@ const chaosSchema = z.object({
 export type ChaosConfig = z.infer<typeof chaosSchema>;
 const chaosBodySchema = z.union([z.object({ enabled: z.literal(false) }), chaosSchema]);
 
+// Mesma conferência da API: fuso impossível viraria NaN no Date.parse e a página sairia vazia.
+const instantParam = z.string().datetime({ offset: true }).refine(isExactInstant);
 const postsQuerySchema = z.object({
-  since: z.string().datetime({ offset: true }),
-  until: z.string().datetime({ offset: true }),
+  since: instantParam,
+  until: instantParam,
   cursor: z.string().max(2_048).optional(),
 });
 

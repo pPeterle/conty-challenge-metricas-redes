@@ -21,16 +21,20 @@ const identifier = (field: string) =>
 
 const ISO_PARTS = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(?:Z|([+-])(\d{2}):?(\d{2}))$/i;
 
+/** Fusos reais vão de -12:00 a +14:00; aceito até ±14:00 para não depender de tabela de fusos. */
+const MAX_OFFSET_MIN = 14 * 60;
+
 /**
  * Conferência de ida e volta: o instante interpretado, visto no fuso que veio no texto, precisa ter
- * exatamente o mesmo ano, mês, dia, hora, minuto e segundo. Recusa 2026-02-30 e qualquer
- * data que o Date do JS "conserte" sozinho.
+ * exatamente o mesmo ano, mês, dia, hora, minuto e segundo. Recusa 2026-02-30, qualquer
+ * data que o Date do JS "conserte" sozinho e fuso impossível (+24:00, +23:60, -15:00).
  */
 export function isExactInstant(value: string): boolean {
   const m = ISO_PARTS.exec(value);
   if (!m) return false;
+  if (m[7] && (Number(m[9]) > 59 || Number(m[8]) * 60 + Number(m[9]) > MAX_OFFSET_MIN)) return false;
   const ms = Date.parse(value);
-  if (Number.isNaN(ms)) return false;
+  if (!Number.isFinite(ms)) return false;
   const offsetMin = m[7] ? (m[7] === "-" ? -1 : 1) * (Number(m[8]) * 60 + Number(m[9])) : 0;
   const local = new Date(ms + offsetMin * 60_000);
   return (

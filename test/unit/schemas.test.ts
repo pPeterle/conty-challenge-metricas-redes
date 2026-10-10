@@ -55,4 +55,11 @@ describe("isExactInstant", () => {
   it.each(["2026-02-30T00:00:00Z", "2026-02-29T00:00:00Z", "2026-09-01T24:00:00Z", "2026-09-01T00:60:00Z", "2026-09-01", "1"])("%s não é", (v) => {
     expect(isExactInstant(v)).toBe(false);
   });
+  it.each(["2026-09-01T00:00:00+14:00", "2026-09-01T00:00:00-14:00", "2026-09-01T00:00:00+05:45"])("fuso %s é aceito", (v) => {
+    expect(isExactInstant(v)).toBe(true);
+  });
+  it.each(["+24:00", "+99:00", "+23:60", "-15:00", "+14:01", "+12:99"])("fuso impossível %s é recusado", (offset) => {
+    expect(isExactInstant(`2026-09-01T00:00:00${offset}`)).toBe(false);
+    expect(syncWindowSchema.safeParse({ since: `2026-09-01T00:00:00${offset}`, until: "2026-09-02T00:00:00Z" }).success).toBe(false);
+  });
 });
