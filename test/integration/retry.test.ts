@@ -124,6 +124,7 @@ describe("429 e Retry-After", () => {
     expect(res.status).toBe(503);
     expect(res.headers.get("retry-after")).toBe("120");
     expect(res.body.error.code).toBe("provider_rate_limited");
+    expect(res.body.error.message).toBe("provedor pediu 120000ms de espera, acima do teto de 10000ms");
     expect(res.body.retry_at).toBe("2026-10-01T10:17:00.000Z");
     expect(res.body.sync_run).toMatchObject({ status: "rate_limited", attempts: 1, retry_at: "2026-10-01T10:17:00.000Z" });
     expect(h.clock.sleeps).toEqual([]);
