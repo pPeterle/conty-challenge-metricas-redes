@@ -76,6 +76,20 @@ describe("orçamento total de tentativas", () => {
   });
 });
 
+describe("política inválida", () => {
+  it.each([
+    ["maxAttempts NaN", { maxAttempts: Number.NaN }],
+    ["maxAttempts infinito", { maxAttempts: Infinity }],
+    ["maxTotalAttempts zero", { maxTotalAttempts: 0 }],
+    ["maxRetryAfterMs negativo", { maxRetryAfterMs: -1 }],
+    ["maxTotalWaitMs NaN", { maxTotalWaitMs: Number.NaN }],
+  ])("%s não repete (give_up com politica_invalida)", (_name, override) => {
+    const bad = { ...policy, ...override };
+    expect(decideRetry({ kind: "transient", reason: "503" }, 1, bad)).toEqual({ action: "give_up", status: "failed", reason: "politica_invalida" });
+    expect(decideRetry({ kind: "rate_limited", retryAfterMs: 1_000 }, 1, bad)).toEqual({ action: "give_up", status: "rate_limited", reason: "politica_invalida" });
+  });
+});
+
 describe("backoffDelayMs", () => {
   it("dobra a cada tentativa e respeita o teto", () => {
     expect([1, 2, 3, 4, 5].map((a) => backoffDelayMs(a, policy))).toEqual([100, 200, 400, 500, 500]);

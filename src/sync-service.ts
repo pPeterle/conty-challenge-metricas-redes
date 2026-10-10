@@ -165,6 +165,7 @@ export class SyncService {
             : `provedor pediu ${askedMs}ms de espera, acima do teto de ${policy.maxRetryAfterMs}ms`,
           max_attempts: `provedor continuou respondendo 429 depois de ${attempt} tentativas`,
           wait_budget_exceeded: `esperar mais ${askedMs}ms passaria do orçamento de ${policy.maxTotalWaitMs}ms por sync`,
+          politica_invalida: "política de retry inválida; o sync não repete",
           attempt_budget_exceeded: `orçamento de ${policy.maxTotalAttempts} chamadas por sync esgotado com o provedor ainda respondendo 429`,
         };
         let message = reasons[decision.reason]!;
@@ -173,6 +174,9 @@ export class SyncService {
       }
       if (decision.reason === "permanent") {
         return { ok: false, status: "failed", code: "provider_rejected", message: describe(response) };
+      }
+      if (decision.reason === "politica_invalida") {
+        return { ok: false, status: "failed", code: "provider_unavailable", message: "política de retry inválida; o sync não repete" };
       }
       if (decision.reason === "wait_budget_exceeded" || decision.reason === "attempt_budget_exceeded") {
         const which = decision.reason === "wait_budget_exceeded"

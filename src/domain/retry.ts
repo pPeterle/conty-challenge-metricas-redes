@@ -27,7 +27,8 @@ export type GiveUpReason =
   | "max_attempts"
   | "retry_after_above_cap"
   | "wait_budget_exceeded"
-  | "attempt_budget_exceeded";
+  | "attempt_budget_exceeded"
+  | "politica_invalida";
 
 export type RetryDecision =
   | { action: "retry"; waitMs: number }
@@ -80,6 +81,11 @@ export function decideRetry(
   policy: RetryPolicy,
   spent: SyncSpend = { waitedMs: 0, attempts: attempt },
 ): RetryDecision {
+  // Defesa própria: com teto NaN, infinito ou <= 0 a comparação nunca daria "pare", então não repete.
+  const limits = [policy.maxAttempts, policy.baseDelayMs, policy.maxDelayMs, policy.maxRetryAfterMs, policy.maxTotalWaitMs, policy.maxTotalAttempts];
+  if (!limits.every((v) => Number.isFinite(v) && v > 0)) {
+    return { action: "give_up", status: failure.kind === "rate_limited" ? "rate_limited" : "failed", reason: "politica_invalida" };
+  }
   const { waitedMs } = spent;
   const attemptsLeft = spent.attempts < policy.maxTotalAttempts;
   if (failure.kind === "permanent") {
