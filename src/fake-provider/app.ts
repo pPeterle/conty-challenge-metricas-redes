@@ -1,4 +1,6 @@
+import { zValidator } from "@hono/zod-validator";
 import { Hono } from "hono";
+import { z } from "zod";
 import type { Clock } from "../clock.ts";
 import { capturedAtFor, DEFAULT_DATASET, listPosts, metricsAt, type DatasetOptions } from "./dataset.ts";
 
@@ -7,23 +9,45 @@ import { capturedAtFor, DEFAULT_DATASET, listPosts, metricsAt, type DatasetOptio
  * HttpProviderClient. Falhas podem ser programadas por conta (fila de faults, usada nos testes)
  * ou sorteadas (chaos, usado no teste de carga).
  */
-export type Fault =
-  | { type: "ok" }
-  | { type: "status"; status: number; retry_after?: string }
-  | { type: "timeout"; hang_ms?: number }
-  | { type: "duplicate_items" }
-  | { type: "cursor_loop" };
+// O simulado também valida o que recebe: as rotas de controle são entrada externa como qualquer outra.
+const faultSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("ok") }),
+  z.object({ type: z.literal("status"), status: z.number().int().min(400).max(599), retry_after: z.string().max(1_000).optional() }),
+  z.object({ type: z.literal("timeout"), hang_ms: z.number().int().positive().max(120_000).optional() }),
+  z.object({ type: z.literal("duplicate_items") }),
+  z.object({ type: z.literal("cursor_loop") }),
+]);
+export type Fault = z.infer<typeof faultSchema>;
 
-export interface ChaosConfig {
-  serverErrorRate: number;
-  rateLimitRate: number;
-  rateLimitRetryAfter: string;
-  longRateLimitRate: number;
-  longRateLimitRetryAfter: string;
-  timeoutRate: number;
-  timeoutHangMs: number;
-  duplicateItemsRate: number;
-}
+const faultsBodySchema = z.object({
+  platform: z.string().min(1).max(64),
+  account: z.string().min(1).max(256),
+  faults: z.array(faultSchema).max(1_000),
+});
+
+const rate = z.number().min(0).max(1);
+const chaosSchema = z.object({
+  serverErrorRate: rate,
+  rateLimitRate: rate,
+  rateLimitRetryAfter: z.string().max(100),
+  longRateLimitRate: rate,
+  longRateLimitRetryAfter: z.string().max(100),
+  timeoutRate: rate,
+  timeoutHangMs: z.number().int().positive().max(120_000),
+  duplicateItemsRate: rate,
+});
+export type ChaosConfig = z.infer<typeof chaosSchema>;
+const chaosBodySchema = z.union([z.object({ enabled: z.literal(false) }), chaosSchema]);
+
+const postsQuerySchema = z.object({
+  since: z.string().datetime({ offset: true }),
+  until: z.string().datetime({ offset: true }),
+  cursor: z.string().max(2_048).optional(),
+});
+
+const badRequest = (result: { success: boolean }, c: { json: (b: unknown, s: 400) => Response }) => {
+  if (!result.success) return c.json({ error: "invalid_request" }, 400);
+};
 
 export interface FakeProviderOptions {
   clock: Clock;
@@ -67,7 +91,7 @@ export function createFakeProviderApp(options: FakeProviderOptions) {
 
   const app = new Hono();
 
-  app.get("/v1/:platform/accounts/:account/posts", async (c) => {
+  app.get("/v1/:platform/accounts/:account/posts", zValidator("query", postsQuerySchema, badRequest), async (c) => {
     const { platform, account } = c.req.param();
     count("requests");
     if (!PLATFORMS.has(platform)) return c.json({ error: "unknown_platform" }, 404);
@@ -79,9 +103,9 @@ export function createFakeProviderApp(options: FakeProviderOptions) {
       return c.json({ error: "invalid_token" }, 401);
     }
 
-    const since = Date.parse(c.req.query("since") ?? "");
-    const until = Date.parse(c.req.query("until") ?? "");
-    if (Number.isNaN(since) || Number.isNaN(until)) return c.json({ error: "invalid_window" }, 400);
+    const query = c.req.valid("query");
+    const since = Date.parse(query.since);
+    const until = Date.parse(query.until);
 
     const fault = nextFault(`${platform}/${account}`);
     if (fault?.type === "status") {
@@ -101,7 +125,7 @@ export function createFakeProviderApp(options: FakeProviderOptions) {
       .filter((p) => p.publishedAt <= now.getTime() && p.publishedAt >= since && p.publishedAt < until)
       .sort((a, b) => b.publishedAt - a.publishedAt);
 
-    const cursor = c.req.query("cursor");
+    const cursor = query.cursor;
     const offset = cursor ? decodeCursor(cursor) : 0;
     if (offset === null) return c.json({ error: "invalid_cursor" }, 400);
 
@@ -132,15 +156,15 @@ export function createFakeProviderApp(options: FakeProviderOptions) {
   });
 
   // Endpoints de controle, só existem no simulado.
-  app.post("/__admin/faults", async (c) => {
-    const body = (await c.req.json()) as { platform: string; account: string; faults: Fault[] };
+  app.post("/__admin/faults", zValidator("json", faultsBodySchema, badRequest), (c) => {
+    const body = c.req.valid("json");
     const key = `${body.platform}/${body.account}`;
     faults.set(key, [...(faults.get(key) ?? []), ...body.faults]);
     return c.json({ queued: faults.get(key)!.length });
   });
 
-  app.put("/__admin/chaos", async (c) => {
-    const body = (await c.req.json()) as ChaosConfig | { enabled: false };
+  app.put("/__admin/chaos", zValidator("json", chaosBodySchema, badRequest), (c) => {
+    const body = c.req.valid("json");
     chaos = "enabled" in body ? null : body;
     return c.json({ chaos });
   });

@@ -34,7 +34,11 @@ describe("conexões", () => {
     const h = createHarness();
     const bad = await h.json("POST", "/connections", { creator_id: "c", platform: "orkut", external_account_id: "x", access_token: "t" });
     expect(bad.status).toBe(400);
-    expect(bad.body.error).toEqual({ code: "validation_error", message: "platform deve ser um de: instagram, tiktok, youtube, x" });
+    expect(bad.body.error).toEqual({
+      code: "validation_error",
+      message: "platform deve ser um de: instagram, tiktok, youtube, x",
+      details: [{ path: "platform", message: "platform deve ser um de: instagram, tiktok, youtube, x" }],
+    });
 
     const conn = await h.connect();
     const badWindow = await h.json("POST", `/connections/${conn.id}/sync`, { since: "2026-09-05T00:00:00Z", until: "2026-09-01T00:00:00Z" });

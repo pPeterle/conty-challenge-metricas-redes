@@ -1,4 +1,5 @@
-import type { PageRequest, ProviderClient, ProviderPage, ProviderPost, ProviderResponse } from "./types.ts";
+import { providerPageSchema } from "../schemas.ts";
+import type { PageRequest, ProviderClient, ProviderPage, ProviderResponse } from "./types.ts";
 
 export type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
 
@@ -75,41 +76,8 @@ export class HttpProviderClient implements ProviderClient {
   }
 }
 
-function isCount(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value >= 0;
-}
-
-function isInstant(value: unknown): value is string {
-  return typeof value === "string" && !Number.isNaN(Date.parse(value));
-}
-
-/**
- * Converte o JSON do provedor para o modelo interno. As datas saem normalizadas em ISO UTC
- * com milissegundos, para que "10:00:00Z" e "10:00:00.000Z" virem a mesma chave de snapshot.
- */
+/** Valida o JSON do provedor com zod e converte para o modelo interno. null = fora do contrato. */
 export function parsePage(body: unknown): ProviderPage | null {
-  if (typeof body !== "object" || body === null) return null;
-  const { data, next_cursor } = body as Record<string, unknown>;
-  if (!Array.isArray(data)) return null;
-  if (next_cursor !== null && next_cursor !== undefined && typeof next_cursor !== "string") return null;
-
-  const posts: ProviderPost[] = [];
-  for (const item of data) {
-    if (typeof item !== "object" || item === null) return null;
-    const raw = item as Record<string, unknown>;
-    const metrics = raw.metrics as Record<string, unknown> | undefined;
-    if (typeof raw.id !== "string" || raw.id === "") return null;
-    if (!isInstant(raw.published_at) || !isInstant(raw.captured_at)) return null;
-    if (!metrics || !isCount(metrics.views) || !isCount(metrics.likes) || !isCount(metrics.comments)) return null;
-    posts.push({
-      externalId: raw.id,
-      publishedAt: new Date(raw.published_at).toISOString(),
-      caption: typeof raw.caption === "string" ? raw.caption : null,
-      capturedAt: new Date(raw.captured_at).toISOString(),
-      views: metrics.views,
-      likes: metrics.likes,
-      comments: metrics.comments,
-    });
-  }
-  return { posts, nextCursor: typeof next_cursor === "string" && next_cursor !== "" ? next_cursor : null };
+  const parsed = providerPageSchema.safeParse(body);
+  return parsed.success ? parsed.data : null;
 }

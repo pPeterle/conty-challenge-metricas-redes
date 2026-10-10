@@ -21,4 +21,13 @@ describe("parsePage", () => {
     expect(parsePage({ data: [{ ...item, metrics: { views: 1.5, likes: 0, comments: 0 } }] })).toBeNull();
     expect(parsePage({ items: [] })).toBeNull();
   });
+
+  it.each(["2026-10-01T10:00:00", "1", "-5", "Oct 1", "2026-02-30T00:00:00Z"])("captured_at %s (sem fuso ou inválido) é recusado", (captured_at) => {
+    expect(parsePage({ data: [{ ...item, captured_at }], next_cursor: null })).toBeNull();
+  });
+
+  it("métrica acima de Number.MAX_SAFE_INTEGER e página gigante são recusadas", () => {
+    expect(parsePage({ data: [{ ...item, metrics: { views: 2 ** 60, likes: 0, comments: 0 } }] })).toBeNull();
+    expect(parsePage({ data: Array(1_001).fill(item) })).toBeNull();
+  });
 });

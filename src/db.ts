@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS posts (
   last_fetched_at TEXT NOT NULL,
   PRIMARY KEY (connection_id, external_post_id)
 );
+CREATE INDEX IF NOT EXISTS posts_connection_published ON posts (connection_id, published_at);
 
 -- Uma linha por medição do provedor. A chave natural (conexão, post, captured_at) é o que
 -- impede que a mesma medição entre duas vezes, venha de onde vier.
@@ -160,12 +161,14 @@ export interface TotalsRow {
 
 // Último snapshot por post, escolhido por captured_at (a medição mais recente do provedor),
 // e não pela ordem de chegada. Totais sempre partem daqui: nunca somam snapshots do mesmo post.
-const LATEST_SNAPSHOTS = `
+// O filtro por conexão fica dentro da subconsulta para usar o índice UNIQUE e não varrer a tabela.
+const latestSnapshots = (connectionFilter: string) => `
   SELECT * FROM (
     SELECT s.*, ROW_NUMBER() OVER (
       PARTITION BY s.connection_id, s.external_post_id ORDER BY s.captured_at DESC
     ) AS rn
     FROM metric_snapshots s
+    WHERE s.connection_id ${connectionFilter}
   ) WHERE rn = 1
 `;
 
@@ -199,7 +202,7 @@ export function createRepository(db: DatabaseSync) {
        VALUES (?, ?, ?, ?, 'running', ?)`,
     ),
     runById: db.prepare(`SELECT * FROM sync_runs WHERE id = ?`),
-    runsByConnection: db.prepare(`SELECT * FROM sync_runs WHERE connection_id = ? ORDER BY started_at DESC, rowid DESC LIMIT ?`),
+    runsByConnection: db.prepare(`SELECT * FROM sync_runs WHERE connection_id = ? ORDER BY started_at DESC, rowid DESC LIMIT ? OFFSET ?`),
     insertAttempt: db.prepare(
       `INSERT INTO sync_attempts (sync_run_id, page, attempt, outcome, http_status, detail, wait_ms, at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -237,20 +240,21 @@ export function createRepository(db: DatabaseSync) {
               (SELECT COUNT(*) FROM metric_snapshots s
                 WHERE s.connection_id = p.connection_id AND s.external_post_id = p.external_post_id) AS snapshots
        FROM posts p
-       JOIN (${LATEST_SNAPSHOTS}) l ON l.connection_id = p.connection_id AND l.external_post_id = p.external_post_id
+       JOIN (${latestSnapshots("= ?")}) l ON l.connection_id = p.connection_id AND l.external_post_id = p.external_post_id
        WHERE p.connection_id = ?
-       ORDER BY p.published_at DESC`,
+       ORDER BY p.published_at DESC, p.external_post_id
+       LIMIT ? OFFSET ?`,
     ),
     snapshotsOfPost: db.prepare(
       `SELECT captured_at, fetched_at, views, likes, comments, sync_run_id FROM metric_snapshots
-       WHERE connection_id = ? AND external_post_id = ? ORDER BY captured_at DESC`,
+       WHERE connection_id = ? AND external_post_id = ? ORDER BY captured_at DESC LIMIT ? OFFSET ?`,
     ),
     postExists: db.prepare(`SELECT 1 FROM posts WHERE connection_id = ? AND external_post_id = ?`),
     connectionTotals: db.prepare(
       `SELECT COUNT(*) AS posts, COALESCE(SUM(views), 0) AS views, COALESCE(SUM(likes), 0) AS likes,
               COALESCE(SUM(comments), 0) AS comments,
               (SELECT MAX(last_fetched_at) FROM posts WHERE connection_id = ?) AS last_fetched_at
-       FROM (${LATEST_SNAPSHOTS}) WHERE connection_id = ?`,
+       FROM (${latestSnapshots("= ?")})`,
     ),
     creatorTotalsByPlatform: db.prepare(
       `SELECT c.platform, COUNT(l.id) AS posts, COALESCE(SUM(l.views), 0) AS views,
@@ -258,7 +262,7 @@ export function createRepository(db: DatabaseSync) {
               (SELECT MAX(p.last_fetched_at) FROM posts p JOIN connections c2 ON c2.id = p.connection_id
                 WHERE c2.creator_id = c.creator_id AND c2.platform = c.platform) AS last_fetched_at
        FROM connections c
-       LEFT JOIN (${LATEST_SNAPSHOTS}) l ON l.connection_id = c.id
+       LEFT JOIN (${latestSnapshots("IN (SELECT id FROM connections WHERE creator_id = ?)")}) l ON l.connection_id = c.id
        WHERE c.creator_id = ?
        GROUP BY c.platform
        ORDER BY c.platform`,
@@ -324,24 +328,24 @@ export function createRepository(db: DatabaseSync) {
       return stmts.runById.get(id) as SyncRunRow | undefined;
     },
 
-    listRuns(connectionId: string, limit = 50): SyncRunRow[] {
-      return stmts.runsByConnection.all(connectionId, limit) as unknown as SyncRunRow[];
+    listRuns(connectionId: string, limit = 50, offset = 0): SyncRunRow[] {
+      return stmts.runsByConnection.all(connectionId, limit, offset) as unknown as SyncRunRow[];
     },
 
     listAttempts(runId: string): SyncAttemptRow[] {
       return stmts.attemptsByRun.all(runId) as unknown as SyncAttemptRow[];
     },
 
-    listPosts(connectionId: string): PostWithMetricsRow[] {
-      return stmts.postsWithMetrics.all(connectionId) as unknown as PostWithMetricsRow[];
+    listPosts(connectionId: string, limit = 100, offset = 0): PostWithMetricsRow[] {
+      return stmts.postsWithMetrics.all(connectionId, connectionId, limit, offset) as unknown as PostWithMetricsRow[];
     },
 
     postExists(connectionId: string, externalPostId: string): boolean {
       return stmts.postExists.get(connectionId, externalPostId) !== undefined;
     },
 
-    listSnapshots(connectionId: string, externalPostId: string): SnapshotRow[] {
-      return stmts.snapshotsOfPost.all(connectionId, externalPostId) as unknown as SnapshotRow[];
+    listSnapshots(connectionId: string, externalPostId: string, limit = 100, offset = 0): SnapshotRow[] {
+      return stmts.snapshotsOfPost.all(connectionId, externalPostId, limit, offset) as unknown as SnapshotRow[];
     },
 
     connectionTotals(connectionId: string): TotalsRow {
@@ -349,7 +353,7 @@ export function createRepository(db: DatabaseSync) {
     },
 
     creatorTotalsByPlatform(creatorId: string): Array<TotalsRow & { platform: Platform }> {
-      return stmts.creatorTotalsByPlatform.all(creatorId) as unknown as Array<TotalsRow & { platform: Platform }>;
+      return stmts.creatorTotalsByPlatform.all(creatorId, creatorId) as unknown as Array<TotalsRow & { platform: Platform }>;
     },
   };
 }

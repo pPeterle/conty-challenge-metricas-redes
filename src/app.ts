@@ -1,12 +1,23 @@
 import { randomUUID } from "node:crypto";
-import { Hono, type Context } from "hono";
-import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { DatabaseSync } from "node:sqlite";
+import { zValidator } from "@hono/zod-validator";
+import { Hono, type Context, type MiddlewareHandler } from "hono";
+import { bodyLimit } from "hono/body-limit";
+import type { ContentfulStatusCode } from "hono/utils/http-status";
+import type { ZodError, ZodSchema } from "zod";
 import type { Clock, Sleep } from "./clock.ts";
 import { createRepository, type ConnectionRow, type SyncRunRow } from "./db.ts";
-import { parseSyncWindow } from "./domain/window.ts";
-import { PLATFORMS, type Platform, type ProviderClient } from "./provider/types.ts";
-import { RateLimitedError, SyncService, type SyncPolicy } from "./sync-service.ts";
+import type { ProviderClient } from "./provider/types.ts";
+import {
+  connectionParamsSchema,
+  createConnectionSchema,
+  creatorParamsSchema,
+  paginationSchema,
+  postParamsSchema,
+  syncWindowSchema,
+  type SyncPolicy,
+} from "./schemas.ts";
+import { RateLimitedError, SyncService } from "./sync-service.ts";
 
 export interface AppDeps {
   db: DatabaseSync;
@@ -22,8 +33,12 @@ export const DEFAULT_POLICY: SyncPolicy = {
   baseDelayMs: 500,
   maxDelayMs: 8_000,
   maxRetryAfterMs: 30_000,
+  maxTotalWaitMs: 60_000,
+  maxRateLimitBlockMs: 24 * 3600 * 1000,
   maxPages: 100,
 };
+
+const MAX_BODY_BYTES = 16 * 1024;
 
 function fail(c: Context, status: ContentfulStatusCode, code: string, message: string, extra: object = {}) {
   return c.json({ error: { code, message }, ...extra }, status);
@@ -35,7 +50,49 @@ function presentConnection(row: ConnectionRow) {
   return rest;
 }
 
-const ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
+type Target = "json" | "query" | "param";
+
+/** Único ponto que converte ZodError no erro padrão: 400, mensagem do primeiro problema e details. */
+function validationError(c: Context, error: ZodError) {
+  const details = error.issues.map((i) => ({ path: i.path.join(".") || "(corpo)", message: i.message }));
+  return c.json({ error: { code: "validation_error", message: details[0]!.message, details } }, 400);
+}
+
+function validate<T extends ZodSchema, K extends Target>(target: K, schema: T) {
+  return zValidator(target, schema, (result, c) => {
+    if (!result.success) return validationError(c, result.error);
+  });
+}
+
+/**
+ * Antes do zod: exige content-type JSON e um corpo que seja JSON parseável. Sem isso o validador
+ * do Hono responderia em texto puro, fora do formato de erro do repo.
+ */
+const requireJson: MiddlewareHandler = async (c, next) => {
+  const type = c.req.header("content-type") ?? "";
+  if (!/^application\/json\b/i.test(type)) {
+    return fail(c, 415, "unsupported_media_type", "envie o corpo como JSON com content-type: application/json");
+  }
+  const text = await c.req.text();
+  if (text.trim() === "") return fail(c, 400, "validation_error", "corpo vazio; envie um objeto JSON");
+  try {
+    JSON.parse(text);
+  } catch {
+    return fail(c, 400, "validation_error", "corpo não é um JSON válido");
+  }
+  await next();
+};
+
+/** Garante objeto (o zod diria "Expected object, received array"; aqui a mensagem é nossa). */
+const requireJsonObject: MiddlewareHandler = async (c, next) => {
+  const body: unknown = await c.req.json();
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    return fail(c, 400, "validation_error", "corpo deve ser um objeto JSON");
+  }
+  await next();
+};
+
+const jsonBody = [requireJson, requireJsonObject] as const;
 
 export function createApp(deps: AppDeps) {
   const repo = createRepository(deps.db);
@@ -52,85 +109,76 @@ export function createApp(deps: AppDeps) {
 
   app.get("/health", (c) => c.json({ ok: true }));
 
-  app.post("/connections", async (c) => {
-    const body = await c.req.json().catch(() => null);
-    if (typeof body !== "object" || body === null) return fail(c, 400, "validation_error", "corpo JSON inválido");
-    const { creator_id, platform, external_account_id, access_token } = body as Record<string, unknown>;
-    if (typeof creator_id !== "string" || !ID_PATTERN.test(creator_id)) {
-      return fail(c, 400, "validation_error", "creator_id é obrigatório (letras, números, ponto, hífen ou sublinhado)");
-    }
-    if (typeof platform !== "string" || !PLATFORMS.includes(platform as Platform)) {
-      return fail(c, 400, "validation_error", `platform deve ser um de: ${PLATFORMS.join(", ")}`);
-    }
-    if (typeof external_account_id !== "string" || !ID_PATTERN.test(external_account_id)) {
-      return fail(c, 400, "validation_error", "external_account_id é obrigatório (letras, números, ponto, hífen ou sublinhado)");
-    }
-    if (typeof access_token !== "string" || access_token.trim() === "") {
-      return fail(c, 400, "validation_error", "access_token é obrigatório (pode ser fictício)");
-    }
+  app.use(
+    "*",
+    bodyLimit({
+      maxSize: MAX_BODY_BYTES,
+      onError: (c) => fail(c, 413, "payload_too_large", `corpo maior que ${MAX_BODY_BYTES / 1024} KB`),
+    }),
+  );
 
-    const { row, created } = repo.createConnection({
-      id: newId(),
-      creator_id,
-      platform: platform as Platform,
-      external_account_id,
-      access_token,
-      created_at: deps.clock.now().toISOString(),
-    });
+  app.post("/connections", ...jsonBody, validate("json", createConnectionSchema), (c) => {
+    const input = c.req.valid("json");
+    const { row, created } = repo.createConnection({ id: newId(), ...input, created_at: deps.clock.now().toISOString() });
     if (!created) {
       return fail(c, 409, "connection_exists", "essa conta já está conectada", { connection: presentConnection(row) });
     }
     return c.json({ connection: presentConnection(row) }, 201);
   });
 
-  app.get("/connections/:id", (c) => {
-    const conn = repo.getConnection(c.req.param("id"));
+  app.get("/connections/:id", validate("param", connectionParamsSchema), (c) => {
+    const conn = repo.getConnection(c.req.valid("param").id);
     if (!conn) return fail(c, 404, "connection_not_found", "conexão não encontrada");
     return c.json({ connection: presentConnection(conn) });
   });
 
-  app.post("/connections/:id/sync", async (c) => {
-    const conn = repo.getConnection(c.req.param("id"));
-    if (!conn) return fail(c, 404, "connection_not_found", "conexão não encontrada");
-    const body = await c.req.json().catch(() => null);
-    const parsed = parseSyncWindow(body);
-    if (!parsed.ok) return fail(c, 400, "validation_error", parsed.message);
+  app.post(
+    "/connections/:id/sync",
+    validate("param", connectionParamsSchema),
+    ...jsonBody,
+    validate("json", syncWindowSchema),
+    async (c) => {
+      const conn = repo.getConnection(c.req.valid("param").id);
+      if (!conn) return fail(c, 404, "connection_not_found", "conexão não encontrada");
 
-    let run: SyncRunRow;
-    try {
-      run = await sync.sync(conn, parsed.window);
-    } catch (error) {
-      if (error instanceof RateLimitedError) {
-        c.header("Retry-After", retryAfterSeconds(error.retryAt, deps.clock));
-        return fail(c, 503, "provider_rate_limited", `${error.message}; nenhuma chamada foi feita`, { retry_at: error.retryAt });
+      let run: SyncRunRow;
+      try {
+        run = await sync.sync(conn, c.req.valid("json"));
+      } catch (error) {
+        if (error instanceof RateLimitedError) {
+          c.header("Retry-After", retryAfterSeconds(error.retryAt, deps.clock));
+          return fail(c, 503, "provider_rate_limited", `${error.message}; nenhuma chamada foi feita`, { retry_at: error.retryAt });
+        }
+        throw error;
       }
-      throw error;
-    }
 
-    if (run.status === "succeeded") return c.json({ sync_run: run }, 201);
-    if (run.status === "rate_limited") {
-      c.header("Retry-After", retryAfterSeconds(run.retry_at!, deps.clock));
-      return fail(c, 503, run.error_code!, run.error_message!, { retry_at: run.retry_at, sync_run: run });
-    }
-    return fail(c, 502, run.error_code!, run.error_message!, { sync_run: run });
-  });
+      if (run.status === "succeeded") return c.json({ sync_run: run }, 201);
+      if (run.status === "rate_limited") {
+        c.header("Retry-After", retryAfterSeconds(run.retry_at!, deps.clock));
+        return fail(c, 503, run.error_code!, run.error_message!, { retry_at: run.retry_at, sync_run: run });
+      }
+      return fail(c, 502, run.error_code!, run.error_message!, { sync_run: run });
+    },
+  );
 
-  app.get("/connections/:id/sync-runs", (c) => {
-    const conn = repo.getConnection(c.req.param("id"));
+  app.get("/connections/:id/sync-runs", validate("param", connectionParamsSchema), validate("query", paginationSchema(50)), (c) => {
+    const conn = repo.getConnection(c.req.valid("param").id);
     if (!conn) return fail(c, 404, "connection_not_found", "conexão não encontrada");
-    return c.json({ sync_runs: repo.listRuns(conn.id) });
+    const page = c.req.valid("query");
+    return c.json({ sync_runs: repo.listRuns(conn.id, page.limit, page.offset), ...page });
   });
 
-  app.get("/sync-runs/:id", (c) => {
-    const run = repo.getRun(c.req.param("id"));
+  app.get("/sync-runs/:id", validate("param", connectionParamsSchema), (c) => {
+    const run = repo.getRun(c.req.valid("param").id);
     if (!run) return fail(c, 404, "sync_run_not_found", "execução de sync não encontrada");
     return c.json({ sync_run: run, attempts: repo.listAttempts(run.id) });
   });
 
-  app.get("/connections/:id/posts", (c) => {
-    const conn = repo.getConnection(c.req.param("id"));
+  app.get("/connections/:id/posts", validate("param", connectionParamsSchema), validate("query", paginationSchema(100)), (c) => {
+    const conn = repo.getConnection(c.req.valid("param").id);
     if (!conn) return fail(c, 404, "connection_not_found", "conexão não encontrada");
-    const posts = repo.listPosts(conn.id).map((p) => ({
+    const page = c.req.valid("query");
+    const posts = repo.listPosts(conn.id, page.limit, page.offset).map((p) => ({
       external_post_id: p.external_post_id,
       published_at: p.published_at,
       caption: p.caption,
@@ -140,26 +188,32 @@ export function createApp(deps: AppDeps) {
       last_fetched_at: p.last_fetched_at,
       snapshots: p.snapshots,
     }));
-    return c.json({ posts });
+    return c.json({ posts, ...page });
   });
 
-  app.get("/connections/:id/posts/:postId/snapshots", (c) => {
-    const conn = repo.getConnection(c.req.param("id"));
-    if (!conn) return fail(c, 404, "connection_not_found", "conexão não encontrada");
-    const postId = c.req.param("postId");
-    if (!repo.postExists(conn.id, postId)) return fail(c, 404, "post_not_found", "post não encontrado nessa conexão");
-    return c.json({ external_post_id: postId, snapshots: repo.listSnapshots(conn.id, postId) });
-  });
+  app.get(
+    "/connections/:id/posts/:postId/snapshots",
+    validate("param", postParamsSchema),
+    validate("query", paginationSchema(100)),
+    (c) => {
+      const { id, postId } = c.req.valid("param");
+      const conn = repo.getConnection(id);
+      if (!conn) return fail(c, 404, "connection_not_found", "conexão não encontrada");
+      if (!repo.postExists(conn.id, postId)) return fail(c, 404, "post_not_found", "post não encontrado nessa conexão");
+      const page = c.req.valid("query");
+      return c.json({ external_post_id: postId, snapshots: repo.listSnapshots(conn.id, postId, page.limit, page.offset), ...page });
+    },
+  );
 
-  app.get("/connections/:id/metrics", (c) => {
-    const conn = repo.getConnection(c.req.param("id"));
+  app.get("/connections/:id/metrics", validate("param", connectionParamsSchema), (c) => {
+    const conn = repo.getConnection(c.req.valid("param").id);
     if (!conn) return fail(c, 404, "connection_not_found", "conexão não encontrada");
     const { last_fetched_at, ...totals } = repo.connectionTotals(conn.id);
     return c.json({ connection_id: conn.id, platform: conn.platform, totals, last_fetched_at });
   });
 
-  app.get("/creators/:creatorId/metrics", (c) => {
-    const creatorId = c.req.param("creatorId");
+  app.get("/creators/:creatorId/metrics", validate("param", creatorParamsSchema), (c) => {
+    const { creatorId } = c.req.valid("param");
     const rows = repo.creatorTotalsByPlatform(creatorId);
     if (rows.length === 0) return fail(c, 404, "creator_not_found", "nenhuma conexão para esse criador");
     const totals = { posts: 0, views: 0, likes: 0, comments: 0 };
