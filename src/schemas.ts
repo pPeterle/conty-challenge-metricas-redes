@@ -139,7 +139,13 @@ export const providerPageSchema = z
 
 // ---------------------------------------------------------------- configuração
 
-const positiveInt = (fallback: number) => z.coerce.number().int().positive().safe().default(fallback);
+const positiveInt = (fallback: number) =>
+  z.coerce
+    .number({ invalid_type_error: "deve ser um número" })
+    .int("deve ser um inteiro")
+    .positive("deve ser maior que zero")
+    .safe("é grande demais")
+    .default(fallback);
 
 /** Variáveis de ambiente da API. Valor inválido (NaN, zero, negativo) impede a subida. */
 export const envSchema = z.object({
