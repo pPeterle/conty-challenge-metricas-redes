@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { envSchema, syncPolicySchema, syncWindowSchema } from "../../src/schemas.ts";
+import { envSchema, isExactInstant, syncPolicySchema, syncWindowSchema } from "../../src/schemas.ts";
 
 describe("syncWindowSchema", () => {
   it("aceita janela ISO com fuso e converte para Date", () => {
@@ -44,5 +44,14 @@ describe("configuração", () => {
     };
     expect(syncPolicySchema.safeParse(policy).success).toBe(false);
     expect(syncPolicySchema.safeParse({ ...policy, maxAttempts: 3, maxRetryAfterMs: Number("abc") }).success).toBe(false);
+  });
+});
+
+describe("isExactInstant", () => {
+  it.each(["2026-09-01T00:00:00Z", "2026-09-01T00:00Z", "2024-02-29T23:59:59.999Z", "2026-09-01T21:00:00-03:00"])("%s é exato", (v) => {
+    expect(isExactInstant(v)).toBe(true);
+  });
+  it.each(["2026-02-30T00:00:00Z", "2026-02-29T00:00:00Z", "2026-09-01T24:00:00Z", "2026-09-01T00:60:00Z", "2026-09-01", "1"])("%s não é", (v) => {
+    expect(isExactInstant(v)).toBe(false);
   });
 });

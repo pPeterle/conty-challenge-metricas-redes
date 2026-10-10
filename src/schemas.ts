@@ -19,11 +19,37 @@ const identifier = (field: string) =>
     .max(128, `${field} pode ter no máximo 128 caracteres`)
     .regex(/^[A-Za-z0-9._-]+$/, `${field} aceita só letras, números, ponto, hífen e sublinhado`);
 
+const ISO_PARTS = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(?:Z|([+-])(\d{2}):?(\d{2}))$/i;
+
+/**
+ * Conferência de ida e volta: o instante interpretado, visto no fuso que veio no texto, precisa ter
+ * exatamente o mesmo ano, mês, dia, hora, minuto e segundo. Recusa 2026-02-30 e qualquer
+ * data que o Date do JS "conserte" sozinho.
+ */
+export function isExactInstant(value: string): boolean {
+  const m = ISO_PARTS.exec(value);
+  if (!m) return false;
+  const ms = Date.parse(value);
+  if (Number.isNaN(ms)) return false;
+  const offsetMin = m[7] ? (m[7] === "-" ? -1 : 1) * (Number(m[8]) * 60 + Number(m[9])) : 0;
+  const local = new Date(ms + offsetMin * 60_000);
+  return (
+    local.getUTCFullYear() === Number(m[1]) &&
+    local.getUTCMonth() + 1 === Number(m[2]) &&
+    local.getUTCDate() === Number(m[3]) &&
+    local.getUTCHours() === Number(m[4]) &&
+    local.getUTCMinutes() === Number(m[5]) &&
+    (m[6] === undefined || local.getUTCSeconds() === Number(m[6]))
+  );
+}
+
+const strictInstant = (message: string) =>
+  z.string().trim().datetime({ offset: true, message }).refine(isExactInstant, message);
+
 const instant = (field: string) =>
   z
     .string({ required_error: `${field} é obrigatório`, invalid_type_error: `${field} deve ser texto` })
-    .trim()
-    .datetime({ offset: true, message: `${field} deve ser uma data ISO 8601 válida com fuso (ex.: 2026-09-01T00:00:00Z)` });
+    .pipe(strictInstant(`${field} deve ser uma data ISO 8601 válida com fuso (ex.: 2026-09-01T00:00:00Z)`));
 
 // ---------------------------------------------------------------- API
 
@@ -32,7 +58,11 @@ export const createConnectionSchema = z.object({
   platform: z.enum(PLATFORMS, {
     errorMap: () => ({ message: `platform deve ser um de: ${PLATFORMS.join(", ")}` }),
   }),
-  external_account_id: identifier("external_account_id"),
+  // Normalizado para "@Ana.Cria " e "ana.cria" serem a mesma conta (e baterem no UNIQUE).
+  external_account_id: z
+    .string({ required_error: "external_account_id é obrigatório", invalid_type_error: "external_account_id deve ser texto" })
+    .transform((v) => v.trim().replace(/^@/, "").toLowerCase())
+    .pipe(identifier("external_account_id")),
   access_token: z
     .string({ required_error: "access_token é obrigatório (pode ser fictício)", invalid_type_error: "access_token deve ser texto" })
     .trim()
@@ -81,9 +111,9 @@ const count = z.number().int().nonnegative().safe();
 const providerPostSchema = z
   .object({
     id: z.string().trim().min(1).max(256),
-    published_at: z.string().datetime({ offset: true }),
+    published_at: strictInstant("published_at inválido"),
     caption: z.string().max(10_000).nullish(),
-    captured_at: z.string().datetime({ offset: true }),
+    captured_at: strictInstant("captured_at inválido"),
     metrics: z.object({ views: count, likes: count, comments: count }),
   })
   // Datas normalizadas em ISO UTC com milissegundos: "10:00:00Z" e "07:00:00.000-03:00" viram a mesma chave.
