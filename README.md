@@ -211,26 +211,26 @@ Com várias instâncias, eu mudaria nesta ordem:
 
 Depois, `scripts/verify-load.ts` lê o banco e a API e falha se: existir snapshot repetido; algum post tiver mais de um snapshot; algum número gravado divergir do provedor; sobrar sync em `running`; existir conexão além das 20 do setup (um payload inválido teria gravado). Em seguida ele desliga o chaos, faz um sync final de cada conexão e compara os totais de cada conexão e de cada criador com o que o provedor diz.
 
-Resultado real de uma execução nesta máquina, no código final (macOS, k6 0.54.0 no Docker, 2026-10-10):
+Resultado real de uma execução nesta máquina, no código final (macOS, k6 0.54.0 no Docker, 2026-10-10, load average perto de 9):
 
 ```
-✓ checks.........................: 100.00% 20584 out of 20584
-✓ { scenario:reads }...........: avg=1.27ms  med=986.28µs p(90)=1.78ms  p(95)=2.35ms
-✓ { scenario:syncs }...........: avg=63.93ms med=1.2ms    p(90)=52.89ms p(95)=163.56ms
-✓ http_req_failed................: 0.00%   0 out of 7505
-  http_reqs......................: 7505    234.990397/s
-✓ invalid_payload_rejected_4xx...: 100.00% 445 out of 445
-  sync_201_succeeded.............: 2007
-  sync_409_em_andamento..........: 1991
-  sync_503_rate_limited..........: 220
-✓ sync_success_rate..............: 99.45%  2007 out of 2018
-provedor durante a carga: {"200":3372,"429":195,"503":399,"requests":4040,"duplicate_items":829,"timeout":74}
-sync_runs: [{"status":"rate_limited","n":11,"attempts":20},{"status":"succeeded","n":2007,"attempts":4020}]
+✓ checks.........................: 100.00% 20676 out of 20676
+✓ { scenario:reads }...........: avg=1.08ms  med=843.69µs p(90)=1.82ms  p(95)=2.58ms
+✓ { scenario:syncs }...........: avg=64.13ms med=1.18ms   p(90)=53.02ms p(95)=168.17ms
+✓ http_req_failed................: 0.00%   0 out of 7575
+  http_reqs......................: 7575    241.96955/s
+✓ invalid_payload_rejected_4xx...: 100.00% 497 out of 497
+  sync_201_succeeded.............: 2032
+  sync_409_em_andamento..........: 1947
+  sync_503_rate_limited..........: 229
+✓ sync_success_rate..............: 99.46%  2032 out of 2043
+provedor durante a carga: {"200":3411,"429":198,"503":407,"requests":4090,"duplicate_items":835,"timeout":74}
+sync_runs: [{"status":"rate_limited","n":11,"attempts":22},{"status":"succeeded","n":2032,"attempts":4068}]
 conexões: 20, snapshots durante a carga: 600, depois do sync final: 600 snapshots para 600 posts
 verificação ok: nenhum snapshot duplicado, números iguais aos do provedor, totais conferem
 ```
 
-`sync_success_rate` conta só os pedidos que abriram um run: 201 contra 502 e contra 503 que traz `sync_run`. Ficam de fora o 409 (outro sync da conexão em andamento) e o 503 sem run (conexão ainda bloqueada pelo `retry_at`), porque nos dois casos o serviço fez o que devia sem chamar o provedor. Das 220 respostas 503, 11 vieram de runs `rate_limited`; as outras foram recusadas antes de chamar o provedor. 4xx e 503 contam como resposta esperada em `http_req_failed`. Os tetos de latência são folgados de propósito para a carga passar em máquinas mais lentas: p95 abaixo de 5 s nos syncs, que esperam `Retry-After` dentro da requisição, e abaixo de 500 ms nas leituras. Checks, payload inválido recusado (`rate==1`), taxa de sucesso (`> 0.9`) e a verificação no banco continuam rígidos. Antes do índice de um run por conexão, a taxa ficava entre 82,9% e 85,9% porque contava também os 503 sem run; com a definição atual, duas execuções deram 99,43% e 99,45%.
+`sync_success_rate` conta só os pedidos que abriram um run: 201 contra 502 e contra 503 que traz `sync_run`. Ficam de fora o 409 (outro sync da conexão em andamento) e o 503 sem run (conexão ainda bloqueada pelo `retry_at`), porque nos dois casos o serviço fez o que devia sem chamar o provedor. Das 229 respostas 503, 11 vieram de runs `rate_limited`; as outras foram recusadas antes de chamar o provedor. 4xx e 503 contam como resposta esperada em `http_req_failed`. Os tetos de latência são folgados de propósito para a carga passar em máquinas mais lentas: p95 abaixo de 5 s nos syncs, que esperam `Retry-After` dentro da requisição, e abaixo de 500 ms nas leituras. Checks, payload inválido recusado (`rate==1`), taxa de sucesso (`> 0.9`) e a verificação no banco continuam rígidos. Antes do índice de um run por conexão, a taxa ficava entre 82,9% e 85,9% porque contava também os 503 sem run; com a definição atual, as execuções ficaram entre 99,43% e 99,46%. O p95 dos syncs oscila bastante entre rodadas: numa rodada anterior no mesmo dia, com load average perto de 17, deu 1 s, porque o percentil cai em cima das esperas de `Retry-After: 1` feitas dentro da requisição.
 
 ## O que ficou de fora
 
