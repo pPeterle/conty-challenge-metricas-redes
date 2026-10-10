@@ -124,7 +124,9 @@ describe("datas estritas", () => {
     const conn = await h.connect();
     const res = await h.json("POST", `/connections/${conn.id}/sync`, { since, until: "2026-09-09T00:00:00Z" });
     expect(res.status).toBe(400);
-    expect(res.body.error.details[0].path).toBe("since");
+    expect(res.body.error.details).toEqual([
+      { path: "since", message: "since deve ser uma data ISO 8601 válida com fuso (ex.: 2026-09-01T00:00:00Z)" },
+    ]);
   });
 
   it("captured_at impossível vindo do provedor torna a página inválida (erro permanente, nada gravado)", async () => {

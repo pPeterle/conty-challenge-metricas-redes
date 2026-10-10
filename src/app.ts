@@ -56,7 +56,11 @@ type Target = "json" | "query" | "param";
 
 /** Único ponto que converte ZodError no erro padrão: 400, mensagem do primeiro problema e details. */
 function validationError(c: Context, error: ZodError) {
-  const details = error.issues.map((i) => ({ path: i.path.join(".") || "(corpo)", message: i.message }));
+  const seen = new Set<string>();
+  const details = error.issues
+    .map((i) => ({ path: i.path.join(".") || "(corpo)", message: i.message }))
+    // O mesmo campo pode falhar em duas checagens com a mesma mensagem (formato e calendário).
+    .filter((d) => !seen.has(`${d.path}:${d.message}`) && seen.add(`${d.path}:${d.message}`));
   return c.json({ error: { code: "validation_error", message: details[0]!.message, details } }, 400);
 }
 
