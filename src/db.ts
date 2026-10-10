@@ -11,6 +11,8 @@ CREATE TABLE IF NOT EXISTS connections (
   external_account_id TEXT NOT NULL,
   access_token TEXT NOT NULL,
   rate_limited_until TEXT,
+  -- needs_reauth: o provedor recusou o token (401); nenhum sync chama o provedor até um token novo.
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'needs_reauth')),
   created_at TEXT NOT NULL,
   UNIQUE (platform, external_account_id)
 );
@@ -112,6 +114,7 @@ export interface ConnectionRow {
   external_account_id: string;
   access_token: string;
   rate_limited_until: string | null;
+  status: "active" | "needs_reauth";
   created_at: string;
 }
 
@@ -219,6 +222,8 @@ export function createRepository(db: DatabaseSync) {
        VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (platform, external_account_id) DO NOTHING`,
     ),
     connectionById: db.prepare(`SELECT * FROM connections WHERE id = ?`),
+    markNeedsReauth: db.prepare(`UPDATE connections SET status = 'needs_reauth' WHERE id = ?`),
+    replaceToken: db.prepare(`UPDATE connections SET access_token = ?, status = 'active' WHERE id = ?`),
     connectionByAccount: db.prepare(`SELECT * FROM connections WHERE platform = ? AND external_account_id = ?`),
     setRateLimitedUntil: db.prepare(
       // Nunca encurta um bloqueio já registrado por outro sync concorrente.
@@ -318,7 +323,7 @@ export function createRepository(db: DatabaseSync) {
     transaction,
 
     /** Devolve a conexão e se ela foi criada agora (false = já existia para a mesma conta). */
-    createConnection(input: Omit<ConnectionRow, "rate_limited_until">): { row: ConnectionRow; created: boolean } {
+    createConnection(input: Omit<ConnectionRow, "rate_limited_until" | "status">): { row: ConnectionRow; created: boolean } {
       const res = stmts.insertConnection.run(
         input.id, input.creator_id, input.platform, input.external_account_id, input.access_token, input.created_at,
       );
@@ -328,6 +333,16 @@ export function createRepository(db: DatabaseSync) {
 
     getConnection(id: string): ConnectionRow | undefined {
       return stmts.connectionById.get(id) as ConnectionRow | undefined;
+    },
+
+    markNeedsReauth(connectionId: string): void {
+      stmts.markNeedsReauth.run(connectionId);
+    },
+
+    /** Token novo reativa a conexão. */
+    replaceToken(connectionId: string, token: string): ConnectionRow | undefined {
+      stmts.replaceToken.run(token, connectionId);
+      return stmts.connectionById.get(connectionId) as ConnectionRow | undefined;
     },
 
     markRateLimited(connectionId: string, until: string): void {

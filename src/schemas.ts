@@ -69,6 +69,8 @@ export const createConnectionSchema = z.object({
     .min(1, "access_token não pode ser vazio")
     .max(4096, "access_token pode ter no máximo 4096 caracteres"),
 });
+export const replaceTokenSchema = z.object({ access_token: createConnectionSchema.shape.access_token });
+
 export type CreateConnectionInput = z.output<typeof createConnectionSchema>;
 
 /** Janela meio aberta [since, until) sobre a data de publicação do post. */

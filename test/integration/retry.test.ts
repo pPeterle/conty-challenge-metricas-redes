@@ -56,7 +56,7 @@ describe("falha transitória", () => {
     const res = await h.sync(conn.id);
 
     expect(res.status).toBe(502);
-    expect(res.body.sync_run).toMatchObject({ status: "failed", attempts: 1, error_code: "provider_rejected" });
+    expect(res.body.sync_run).toMatchObject({ status: "failed", attempts: 1, error_code: "provider_unauthorized" });
     expect(h.providerRequests).toBe(1);
     expect(h.clock.sleeps).toEqual([]);
   });

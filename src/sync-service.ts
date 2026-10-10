@@ -22,6 +22,13 @@ export class RateLimitedError extends Error {
   }
 }
 
+/** O provedor recusou o token: só um token novo (PUT /connections/:id/token) libera o sync. */
+export class NeedsReauthError extends Error {
+  constructor() {
+    super("o provedor recusou o token desta conexão; envie um token novo em PUT /connections/:id/token");
+  }
+}
+
 type PageOutcome =
   | { ok: true; page: ProviderPage }
   | { ok: false; status: "failed" | "rate_limited"; code: string; message: string; retryAt?: string };
@@ -35,6 +42,7 @@ export class SyncService {
   async sync(connection: ConnectionRow, window: SyncWindow): Promise<SyncRunRow> {
     const { repo, clock, newId } = this.deps;
     const now = clock.now();
+    if (connection.status === "needs_reauth") throw new NeedsReauthError();
     if (connection.rate_limited_until && Date.parse(connection.rate_limited_until) > now.getTime()) {
       throw new RateLimitedError(connection.rate_limited_until);
     }
@@ -167,6 +175,10 @@ export class SyncService {
         return { ok: false, status: "rate_limited", code: "provider_rate_limited", message, retryAt };
       }
       if (decision.reason === "permanent") {
+        if (response.httpStatus === 401) {
+          repo.markNeedsReauth(connection.id);
+          return { ok: false, status: "failed", code: "provider_unauthorized", message: `${describe(response)}; conexão marcada como needs_reauth` };
+        }
         return { ok: false, status: "failed", code: "provider_rejected", message: describe(response) };
       }
       if (decision.reason === "politica_invalida") {

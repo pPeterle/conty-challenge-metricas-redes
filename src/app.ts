@@ -14,10 +14,11 @@ import {
   creatorParamsSchema,
   paginationSchema,
   postParamsSchema,
+  replaceTokenSchema,
   syncWindowSchema,
   type SyncPolicy,
 } from "./schemas.ts";
-import { RateLimitedError, SyncService } from "./sync-service.ts";
+import { NeedsReauthError, RateLimitedError, SyncService } from "./sync-service.ts";
 
 export interface AppDeps {
   db: DatabaseSync;
@@ -139,6 +140,13 @@ export function createApp(deps: AppDeps) {
     return c.json({ connection: presentConnection(conn) });
   });
 
+  app.put("/connections/:id/token", validate("param", connectionParamsSchema), ...jsonBody, validate("json", replaceTokenSchema), (c) => {
+    const id = c.req.valid("param").id;
+    if (!repo.getConnection(id)) return fail(c, 404, "connection_not_found", "conexão não encontrada");
+    const row = repo.replaceToken(id, c.req.valid("json").access_token)!;
+    return c.json({ connection: presentConnection(row) });
+  });
+
   app.post(
     "/connections/:id/sync",
     validate("param", connectionParamsSchema),
@@ -152,6 +160,9 @@ export function createApp(deps: AppDeps) {
       try {
         run = await sync.sync(conn, c.req.valid("json"));
       } catch (error) {
+        if (error instanceof NeedsReauthError) {
+          return fail(c, 409, "reautorizacao_necessaria", error.message);
+        }
         if (error instanceof RateLimitedError) {
           c.header("Retry-After", retryAfterSeconds(error.retryAt, deps.clock));
           return fail(c, 503, "provider_rate_limited", `${error.message}; nenhuma chamada foi feita`, { retry_at: error.retryAt });
