@@ -32,6 +32,7 @@ Configuração da API por variável de ambiente. Tudo passa por um schema zod na
 | `SYNC_MAX_TOTAL_WAIT_MS` | 60000 | soma máxima das esperas de um sync |
 | `SYNC_MAX_RATE_LIMIT_BLOCK_MS` | 86400000 | por quanto tempo, no máximo, um 429 bloqueia a conexão |
 | `SYNC_STALE_RUN_MS` | 900000 | idade a partir da qual um run em `running` é dado como abandonado |
+| `SYNC_MAX_FUTURE_SKEW_MS` | 300000 | quanto um `captured_at` pode estar à frente do nosso relógio |
 | `SYNC_MAX_PAGES` | 100 | proteção contra paginação sem fim |
 
 ## Onde fica cada coisa
@@ -57,15 +58,20 @@ O provedor simulado não é importado pela API. Nos testes de integração, o cl
 ## Modelo de dados
 
 ```
-connections       (id, creator_id, platform, external_account_id, access_token, rate_limited_until)
+connections       (id, creator_id, platform, external_account_id, access_token, rate_limited_until,
+                   status active|needs_reauth)
                   UNIQUE (platform, external_account_id)
 posts             (connection_id, external_post_id) PK, published_at, caption,
                   first_fetched_at, last_fetched_at
 metric_snapshots  (connection_id, external_post_id, captured_at) UNIQUE,
                   views, likes, comments, fetched_at, sync_run_id
 sync_runs         id, connection_id, janela, status, started_at, finished_at, attempts, pages,
-                  items_received, items_out_of_window, snapshots_inserted, snapshots_duplicated,
-                  error_code, error_message, retry_at
+                  items_received, items_out_of_window, items_captured_in_future,
+                  snapshots_inserted, snapshots_duplicated, snapshot_conflicts,
+                  error_code, error_message, retry_at, resume_cursor, resumed_from
+                  UNIQUE (connection_id) WHERE status = 'running'
+sync_anomalies    o que foi recusado ou estranhado, item a item: kind (fora_da_janela,
+                  captured_at_no_futuro, snapshot_conflitante), external_post_id, detail
 sync_attempts     uma linha por chamada ao provedor: page, attempt, outcome, http_status,
                   detail, wait_ms, at
 ```
@@ -89,22 +95,26 @@ Cada número que o provedor manda é um snapshot identificado por `(conexão, po
 - o mesmo item duas vezes na mesma página;
 - a mesma janela sincronizada duas vezes;
 - janelas que se sobrepõem;
-- dois syncs da mesma conexão rodando ao mesmo tempo;
 - um retry depois de um timeout em que o provedor tinha respondido.
 
 As datas são normalizadas para ISO UTC com milissegundos antes de virarem chave. Sem isso, `10:00:00Z` e `07:00:00.000-03:00` seriam snapshots diferentes. O mesmo `external_post_id` em duas conexões não se mistura, porque a conexão faz parte da chave.
 
 Quando o provedor mede de novo (outro `captured_at`), entra um snapshot novo e o histórico fica preservado. A métrica atual do post é o snapshot com o maior `captured_at`, e não o último que chegou: se um cache velho do provedor devolver uma medição antiga depois de uma nova, ela vai para o histórico e não substitui a atual. Os totais da conexão e do criador somam só esse snapshot mais recente de cada post (`latestSnapshots` em `src/db.ts`). Somar snapshots do mesmo post nunca acontece.
 
-Se o provedor mandar números diferentes com o mesmo `captured_at`, fica o primeiro que chegou. Para mim, a mesma medição não pode ter dois valores, e eu preferi não deixar um reenvio sobrescrever dado silenciosamente.
+Se o provedor mandar números diferentes com o mesmo `captured_at`, fica o primeiro que chegou, e o conflito fica registrado: o run conta em `snapshot_conflicts` e `sync_anomalies` guarda o que estava gravado e o que chegou. Para mim, a mesma medição não pode ter dois valores, e eu preferi não deixar um reenvio sobrescrever dado.
 
-Post que o provedor devolve com `published_at` fora da janela pedida é descartado e contado em `items_out_of_window` no run.
+Duas coisas que o provedor manda não viram métrica e entram como anomalia no run (`GET /sync-runs/:id` lista):
+
+- post com `published_at` fora da janela pedida (`items_out_of_window`);
+- medição com `captured_at` mais de `SYNC_MAX_FUTURE_SKEW_MS` à frente do nosso relógio (`items_captured_in_future`). Como a métrica atual é a de maior `captured_at`, uma medição datada de 2099 viraria a atual para sempre e esconderia as medições reais seguintes.
 
 Cada página é gravada numa transação (`BEGIN IMMEDIATE`). Se a gravação falha no meio, a página inteira é desfeita. Se a página 2 falha no provedor, o que veio na página 1 fica gravado; como a gravação é idempotente, rodar o sync de novo completa sem duplicar.
 
 ### Sync concorrente da mesma conexão
 
-Eu não coloquei lock. Dois syncs da mesma conexão podem rodar juntos, e o resultado final é o mesmo, porque a unicidade está no banco. O custo é gastar chamadas do provedor em dobro nesse caso. Um lock exigiria tratar lock órfão, e na escala do desafio a idempotência já garante que os números saiam certos. O teste `syncs concorrentes da mesma conexão com janelas sobrepostas terminam com um snapshot por post` dispara 10 syncs com `Promise.all`, e a carga faz isso com 40 usuários virtuais em 20 conexões.
+Um sync por conexão por vez. Um índice único parcial (`sync_runs (connection_id) WHERE status = 'running'`) faz o banco recusar o segundo run, e a API responde 409 `sync_em_andamento` com o id do run que está rodando. Antes, eu deixava dois syncs rodarem juntos e confiava só na idempotência; o resultado era o mesmo, mas gastava a cota do provedor em dobro. Um run preso em `running` (processo que caiu) não trava a conexão para sempre: ao iniciar um sync, runs `running` mais velhos que `SYNC_STALE_RUN_MS` viram `failed`/`abandonado`. A idempotência continua valendo para tudo o que não é concorrência (janelas sobrepostas, páginas repetidas, retries). O teste `syncs concorrentes da mesma conexão: um roda, os outros recebem 409...` dispara 10 syncs com `Promise.all`, e a carga faz isso com 40 usuários virtuais em 20 conexões.
+
+Depois de um `rate_limited` no meio da paginação, o run guarda `resume_cursor`, e o próximo sync da mesma janela continua daquela página (`resumed_from` aponta o run anterior).
 
 ## Quando a métrica foi buscada
 
@@ -115,7 +125,8 @@ Cada snapshot tem `captured_at` (quando o provedor mediu) e `fetched_at` (quando
 A decisão está em `decideRetry` (`src/domain/retry.ts`):
 
 - Falha transitória (timeout via AbortController, erro de rede, 5xx, 408): repete com backoff exponencial `base * 2^(tentativa-1)`, limitado a `SYNC_BACKOFF_MAX_MS`, até `SYNC_MAX_ATTEMPTS` por página. Depois disso o sync termina `failed` com `provider_unavailable`. Uma resposta que chega depois do timeout é ignorada e não grava nada.
-- Erro permanente (401, 403, 404, JSON fora do contrato): não repete. O sync termina `failed` com `provider_rejected`.
+- Erro permanente (403, 404, JSON fora do contrato): não repete. O sync termina `failed` com `provider_rejected`.
+- 401: o provedor recusou o token. O sync termina `failed` com `provider_unauthorized` e a conexão fica `needs_reauth`. Os syncs seguintes respondem 409 `reautorizacao_necessaria` sem chamar o provedor, até `PUT /connections/:id/token` com um token novo reativar a conexão.
 - 429: lê o `Retry-After` em segundos ou em HTTP-date e espera exatamente esse prazo. Se o pedido for maior que `SYNC_MAX_RETRY_AFTER_MS`, o sync não espera: termina `rate_limited`, grava `retry_at` e devolve 503 com `Retry-After`. O 429 também conta para o teto de tentativas, inclusive com `Retry-After: 0`. Sem `Retry-After` válido, usa o mesmo backoff das falhas transitórias.
 - Depois de um `rate_limited`, a conexão guarda `rate_limited_until`. Até esse instante, um novo sync responde 503 sem chamar o provedor. O bloqueio nunca passa de `SYNC_MAX_RATE_LIMIT_BLOCK_MS` (24 h por padrão), mesmo que o provedor peça anos; o valor original fica no `detail` da tentativa.
 - O sync inteiro tem dois orçamentos: `SYNC_MAX_TOTAL_ATTEMPTS` chamadas e `SYNC_MAX_TOTAL_WAIT_MS` de espera somada. Se a próxima espera ou a próxima chamada estouraria um deles, o sync para (`rate_limited` quando o provedor estava em 429, `failed` nos outros casos) com a mensagem dizendo qual orçamento acabou. O teto de páginas e um guarda contra cursor repetido completam a garantia de que o sync sempre termina.
@@ -141,6 +152,23 @@ Toda entrada passa por um schema zod em `src/schemas.ts`: corpo, query, parâmet
 | Dá para saber quando a métrica foi buscada | `fetched_at`, `last_fetched_at`, `sync_runs`, `sync_attempts` | "cada post mostra captured_at (medição do provedor), fetched_at (nossa busca) e last_fetched_at" |
 | Fronteira legível entre provedor falso e regra | `src/provider/types.ts` | todos os testes de integração passam pelo `HttpProviderClient` real |
 | Entrada inválida nunca vira 500 nem grava | `src/schemas.ts`, `requireJson` em `src/app.ts` | `payloads-invalidos.test.ts`, `bordas.test.ts` |
+| Medição do futuro não vira a atual | `screenPosts` em `src/sync-service.ts` | `bordas.test.ts`: "medição datada muito à frente do relógio não vira a atual..." |
+| Conflito de medição registrado | `ingestPage` em `src/db.ts` | `idempotency.test.ts`: "vale o primeiro e o conflito fica registrado no run" |
+| Um sync por conexão | índice `sync_runs_one_running` | `idempotency.test.ts`: "syncs concorrentes da mesma conexão: um roda...", `sync-runs.test.ts` |
+| 401 pede reautorização | `SyncService`, `PUT /connections/:id/token` | `reauth.test.ts` |
+
+### Mutações que os testes pegam
+
+Para conferir que os testes protegem as regras, apliquei cada mutação abaixo no código, rodei `npm test` e reverti:
+
+| Mutação | Testes que falharam |
+|---|---|
+| Somar todos os snapshots em vez de pegar o mais recente (`WHERE rn = 1` virou `rn >= 1` em `latestSnapshots`) | 4, entre eles "nova medição do provedor vira novo snapshot e o total usa só a mais recente, sem somar" e "somam o snapshot mais recente de cada post em todas as plataformas" |
+| Esperar metade do `Retry-After` (`waitMs / 2` no `decideRetry`) | 9, entre eles "429 com Retry-After em segundos espera exatamente esse prazo no relógio controlado" e "429 com Retry-After em HTTP-date espera até a data pedida" |
+| Tirar o teto de tentativas das falhas transitórias | 3, entre eles "falha transitória persistente para no teto de tentativas, sem loop infinito" |
+| Tirar o teto do `Retry-After` | 2: "Retry-After acima do teto configurado para o sync..." e o unitário "429 com Retry-After acima do teto para sem esperar" |
+
+A última mutação só pegava o teste unitário no começo, porque o orçamento de espera também barrava a espera longa e o teste de integração conferia só o código do erro. Passei a conferir também a mensagem, e agora os dois falham.
 
 ## Exemplos
 
@@ -152,7 +180,7 @@ curl -X POST localhost:3102/connections/ac64a167-.../sync -H 'content-type: appl
 ```
 
 ```json
-{"sync_run":{"id":"068b984e-...","status":"succeeded","attempts":3,"pages":3,"items_received":24,"items_out_of_window":0,"snapshots_inserted":14,"snapshots_duplicated":10,"...":"..."}}
+{"sync_run":{"id":"068b984e-...","status":"succeeded","attempts":3,"pages":3,"items_received":24,"snapshots_inserted":14,"snapshots_duplicated":10,"...":"..."}}
 ```
 
 Essa janela se sobrepunha a uma anterior: dos 24 itens, 10 já existiam e não foram gravados de novo.
@@ -163,45 +191,46 @@ retry-after: 120
 {"error":{"code":"provider_rate_limited","message":"provedor pediu 120000ms de espera, acima do teto de 10000ms"},"retry_at":"2026-10-10T04:18:53.032Z","sync_run":{"status":"rate_limited","attempts":1,"...":"..."}}
 ```
 
-Rotas: `POST /connections`, `GET /connections/:id`, `POST /connections/:id/sync`, `GET /connections/:id/sync-runs`, `GET /sync-runs/:id`, `GET /connections/:id/posts`, `GET /connections/:id/posts/:postId/snapshots`, `GET /connections/:id/metrics`, `GET /creators/:creatorId/metrics`, `GET /health`.
+Rotas: `POST /connections`, `GET /connections/:id`, `PUT /connections/:id/token`, `POST /connections/:id/sync`, `GET /connections/:id/sync-runs`, `GET /sync-runs/:id`, `GET /connections/:id/posts`, `GET /connections/:id/posts/:postId/snapshots`, `GET /connections/:id/metrics`, `GET /creators/:creatorId/metrics`, `GET /health`.
 
 ## Por que essa solução
 
-Um processo Node com sqlite serializa as escritas. Com a unicidade no banco e uma transação por página, isso basta para a ordem de grandeza do desafio: dezenas de conexões, cada uma com algumas páginas por sync, e syncs disparados por agendamento ou por um botão. Redis ou lock distribuído não resolveriam nada que o `UNIQUE` já não resolva, porque o sync não tem efeito colateral externo além de ler o provedor.
+Um processo Node com sqlite serializa as escritas. Com a unicidade no banco, uma transação por página e o índice que permite um run em andamento por conexão, isso basta para a ordem de grandeza do desafio: dezenas de conexões, cada uma com algumas páginas por sync, e syncs disparados por agendamento ou por um botão. Redis ou lock distribuído não resolveriam nada que essas restrições do banco já não resolvam, porque o sync não tem efeito colateral externo além de ler o provedor.
 
 O sync roda dentro da requisição HTTP e espera o `Retry-After` ali mesmo, o que deixa o comportamento fácil de ver e de testar. A desvantagem é segurar a requisição durante a espera. Por isso existem o teto por espera, o orçamento total e, acima deles, a devolução do controle com `retry_at`.
 
 Com várias instâncias, eu mudaria nesta ordem:
 
 1. Postgres com as mesmas restrições `UNIQUE` e `INSERT ... ON CONFLICT DO NOTHING`. A idempotência continua igual.
-2. Sync como job numa fila (o próprio Postgres serve, com `SELECT ... FOR UPDATE SKIP LOCKED`), com uma linha de lease por conexão para não gastar cota do provedor em syncs duplicados. A espera do 429 vira reagendamento do job para `retry_at`.
+2. Sync como job numa fila (o próprio Postgres serve, com `SELECT ... FOR UPDATE SKIP LOCKED`). O índice único parcial de run em andamento funciona igual no Postgres. A espera do 429 vira reagendamento do job para `retry_at`.
 3. Cota por token do provedor compartilhada entre instâncias. Só aí um contador central (Redis ou tabela) faria sentido.
 
 ## Resultado do teste de carga
 
-`npm run load` sobe o provedor simulado com chaos ligado e semente fixa (`CHAOS_SEED=42`): 10% de 503, 5% de 429 com `Retry-After: 1`, 0,2% de 429 com `Retry-After: 3` acima do teto de 2 s, 2% de timeout, 20% de itens duplicados na página e post repetido entre páginas sempre. O relógio do simulado fica congelado, então cada post tem exatamente uma medição. A API roda com timeout de 1 s, 6 tentativas e backoff de 50 ms a 800 ms. O k6 cria 20 conexões e roda 40 usuários virtuais disparando syncs com janelas aleatórias que quase sempre se sobrepõem (10% das iterações mandam payload inválido, que precisa voltar 4xx), mais 5 lendo métricas, por 30 s.
+`npm run load` sobe o provedor simulado com chaos ligado e semente fixa (`CHAOS_SEED=42`): 10% de 503, 5% de 429 com `Retry-After: 1`, 0,2% de 429 com `Retry-After: 3` acima do teto de 2 s, 2% de timeout, 20% de itens duplicados na página e post repetido entre páginas sempre. O relógio do simulado fica congelado, então cada post tem exatamente uma medição. A API roda com timeout de 1 s, 6 tentativas e backoff de 50 ms a 800 ms. O k6 cria 20 conexões e roda 40 usuários virtuais disparando syncs com janelas aleatórias que quase sempre se sobrepõem, mais 5 lendo métricas, por 30 s. 10% das iterações mandam payload inválido, que precisa voltar 4xx. Como só um sync por conexão roda por vez, muitos pedidos voltam 409; o usuário virtual espera de 200 a 500 ms antes de tentar de novo, e espera o `Retry-After` (até 1 s) depois de um 503.
 
 Depois, `scripts/verify-load.ts` lê o banco e a API e falha se: existir snapshot repetido; algum post tiver mais de um snapshot; algum número gravado divergir do provedor; sobrar sync em `running`; existir conexão além das 20 do setup (um payload inválido teria gravado). Em seguida ele desliga o chaos, faz um sync final de cada conexão e compara os totais de cada conexão e de cada criador com o que o provedor diz.
 
 Resultado real de uma execução nesta máquina, no código final (macOS, k6 0.54.0 no Docker, 2026-10-10):
 
 ```
-✓ checks.........................: 100.00% 33153 out of 33153
-✓ { scenario:reads }...........: avg=1.17ms   med=846.96µs p(90)=1.69ms   p(95)=2.41ms
-✓ { scenario:syncs }...........: avg=116.91ms med=1.56ms   p(90)=153.36ms p(95)=1.01s
-✓ http_req_failed................: 0.00%   0 out of 13314
-  http_reqs......................: 13314   419.568971/s
-✓ invalid_payload_rejected_4xx...: 100.00% 1041 out of 1041
-  sync_201_succeeded.............: 7802
-  sync_503_rate_limited..........: 1607
-✓ sync_success_rate..............: 82.92%  7802 out of 9409
-provedor durante a carga: {"200":13034,"429":810,"503":1584,"requests":15727,"duplicate_items":3140,"timeout":299}
-sync_runs: [{"status":"rate_limited","n":33,"attempts":55},{"status":"succeeded","n":7802,"attempts":15672}]
+✓ checks.........................: 100.00% 20584 out of 20584
+✓ { scenario:reads }...........: avg=1.27ms  med=986.28µs p(90)=1.78ms  p(95)=2.35ms
+✓ { scenario:syncs }...........: avg=63.93ms med=1.2ms    p(90)=52.89ms p(95)=163.56ms
+✓ http_req_failed................: 0.00%   0 out of 7505
+  http_reqs......................: 7505    234.990397/s
+✓ invalid_payload_rejected_4xx...: 100.00% 445 out of 445
+  sync_201_succeeded.............: 2007
+  sync_409_em_andamento..........: 1991
+  sync_503_rate_limited..........: 220
+✓ sync_success_rate..............: 99.45%  2007 out of 2018
+provedor durante a carga: {"200":3372,"429":195,"503":399,"requests":4040,"duplicate_items":829,"timeout":74}
+sync_runs: [{"status":"rate_limited","n":11,"attempts":20},{"status":"succeeded","n":2007,"attempts":4020}]
 conexões: 20, snapshots durante a carga: 600, depois do sync final: 600 snapshots para 600 posts
 verificação ok: nenhum snapshot duplicado, números iguais aos do provedor, totais conferem
 ```
 
-O p95 de 1,01 s dos syncs vem quase todo da espera de `Retry-After: 1`; a mediana fica em 1,56 ms. Das 1607 respostas 503, 33 vieram de syncs que receberam um 429 acima do teto ou esgotaram as tentativas. As outras foram syncs recusados sem chamar o provedor, porque a conexão ainda estava dentro do `retry_at`. Nesta execução nenhum sync terminou `failed`; em outras, apareceu um 502 isolado quando uma página pegou 6 falhas transitórias seguidas, o que o teto permite. 4xx e 503 contam como resposta esperada em `http_req_failed`, e a taxa de sucesso dos syncs tem threshold próprio (`> 0.7`). Os tetos de latência são folgados de propósito para a carga passar em máquinas mais lentas: p95 abaixo de 5 s nos syncs, que esperam `Retry-After` dentro da requisição, e abaixo de 500 ms nas leituras. Checks, payload inválido recusado (`rate==1`), taxa de erro e a verificação no banco continuam rígidos. Rodei a carga seis vezes com a semente fixa enquanto fazia as últimas mudanças, e a taxa ficou entre 82,9% e 85,9%. A semente repete a sequência de falhas sorteadas, mas a ordem das requisições muda entre execuções, então o número exato também muda um pouco.
+`sync_success_rate` conta só os pedidos que abriram um run: 201 contra 502 e contra 503 que traz `sync_run`. Ficam de fora o 409 (outro sync da conexão em andamento) e o 503 sem run (conexão ainda bloqueada pelo `retry_at`), porque nos dois casos o serviço fez o que devia sem chamar o provedor. Das 220 respostas 503, 11 vieram de runs `rate_limited`; as outras foram recusadas antes de chamar o provedor. 4xx e 503 contam como resposta esperada em `http_req_failed`. Os tetos de latência são folgados de propósito para a carga passar em máquinas mais lentas: p95 abaixo de 5 s nos syncs, que esperam `Retry-After` dentro da requisição, e abaixo de 500 ms nas leituras. Checks, payload inválido recusado (`rate==1`), taxa de sucesso (`> 0.9`) e a verificação no banco continuam rígidos. Antes do índice de um run por conexão, a taxa ficava entre 82,9% e 85,9% porque contava também os 503 sem run; com a definição atual, duas execuções deram 99,43% e 99,45%.
 
 ## O que ficou de fora
 
@@ -213,8 +242,7 @@ O p95 de 1,01 s dos syncs vem quase todo da espera de `Retry-After: 1`; a median
 
 ## O que eu faria diferente com mais tempo
 
-- Rodar o sync como job, com lease por conexão, e devolver `202` com o id da execução.
-- Registrar conflito quando o mesmo `captured_at` chega com números diferentes.
+- Rodar o sync como job e devolver `202` com o id da execução, em vez de segurar a requisição durante o `Retry-After`.
 - Quando o provedor não manda `captured_at`, usar um hash do conteúdo como chave do snapshot. Hoje um item sem `captured_at` torna a página inválida.
 - Respeitar headers de cota que algumas APIs mandam antes do 429 (`X-RateLimit-Remaining`) para desacelerar antes de ser barrado.
 

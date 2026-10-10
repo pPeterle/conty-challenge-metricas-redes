@@ -7,7 +7,7 @@ PROVIDER_PORT=3112 npm run provider
 PORT=3102 PROVIDER_BASE_URL=http://localhost:3112 SYNC_MAX_RETRY_AFTER_MS=10000 npm start
 ```
 
-IDs encurtados com `...`. Os números de views mudam conforme a hora em que você roda, porque o simulado mede de hora em hora.
+IDs encurtados com `...`. Os números de views mudam conforme a hora em que você roda, porque o simulado mede de hora em hora. As seções até "429 e Retry-After" vieram de uma primeira execução, anterior a alguns campos (`status` da conexão; `items_captured_in_future`, `snapshot_conflicts`, `resume_cursor` e `resumed_from` do run). A seção "Um sync por conexão, anomalias e reautorização" mostra a resposta completa atual.
 
 ## Conexão
 
@@ -22,7 +22,7 @@ curl -X POST localhost:3102/connections -H 'content-type: application/json' \
 {"connection":{"id":"ac64a167-...","creator_id":"criadora-1","platform":"instagram","external_account_id":"ana.cria","rate_limited_until":null,"created_at":"2026-10-10T04:16:49.713Z"}}
 ```
 
-A mesma conta de novo, escrita como `ana.cria`, responde `409`:
+A mesma conta de novo, escrita como `ana.cria`, responde `409`. As respostas de conexão desta primeira execução são de antes do campo `status` (`active` ou `needs_reauth`), que hoje também aparece:
 
 ```json
 {"error":{"code":"connection_exists","message":"essa conta já está conectada"},"connection":{"id":"ac64a167-...","external_account_id":"ana.cria","...":"..."}}
@@ -110,6 +110,51 @@ Logo em seguida, outro sync nem chama o provedor:
 HTTP/1.1 503 Service Unavailable
 retry-after: 120
 {"error":{"code":"provider_rate_limited","message":"provedor pediu para aguardar até 2026-10-10T04:18:53.032Z; nenhuma chamada foi feita"},"retry_at":"2026-10-10T04:18:53.032Z"}
+```
+
+## Um sync por conexão, anomalias e reautorização
+
+Estas saídas vieram de uma segunda execução, já com os campos novos do `sync_run`. Um sync completo agora tem esta forma:
+
+```json
+{"sync_run":{"id":"30249f7a-...","connection_id":"8707e8e3-...","window_since":"2026-09-01T00:00:00.000Z","window_until":"2026-09-05T00:00:00.000Z","status":"succeeded","started_at":"2026-10-10T13:07:25.464Z","finished_at":"2026-10-10T13:07:25.485Z","attempts":2,"pages":2,"items_received":17,"items_out_of_window":0,"items_captured_in_future":0,"snapshots_inserted":16,"snapshots_duplicated":1,"snapshot_conflicts":0,"error_code":null,"error_message":null,"retry_at":null,"resume_cursor":null,"resumed_from":null}}
+```
+
+Segundo sync da mesma conexão enquanto o primeiro espera um `Retry-After: 2` (`409`):
+
+```json
+{"error":{"code":"sync_em_andamento","message":"já existe um sync em andamento para esta conexão (sync_run 788d03ed-...)"},"running_sync_run_id":"788d03ed-..."}
+```
+
+Programei a primeira página com `captured_at` de 2099 e a segunda com a mesma medição já gravada, mas 500 views a mais. O sync termina bem, sem gravar nada disso:
+
+```json
+{"sync_run":{"id":"df928384-...","status":"succeeded","items_received":33,"items_captured_in_future":10,"snapshots_inserted":0,"snapshots_duplicated":23,"snapshot_conflicts":10,"...":"..."}}
+```
+
+Duas das 20 anomalias que `GET /sync-runs/df928384-...` lista:
+
+```json
+{"kind":"captured_at_no_futuro","external_post_id":"instagram-ana.cria-p030","detail":"captured_at=2099-01-01T00:00:00.000Z","at":"2026-10-10T13:07:29.041Z"}
+{"kind":"snapshot_conflitante","external_post_id":"instagram-ana.cria-p021","detail":"captured_at=2026-10-10T13:00:00.000Z gravado={\"views\":21449,\"likes\":1286,\"comments\":128} recebido={\"views\":21949,\"likes\":1286,\"comments\":128}","at":"2026-10-10T13:07:29.042Z"}
+```
+
+Conexão com token que o provedor recusa (`502`, e a conexão fica `needs_reauth`):
+
+```json
+{"error":{"code":"provider_unauthorized","message":"provedor respondeu 401 {\"error\":\"invalid_token\"}; conexão marcada como needs_reauth"},"sync_run":{"status":"failed","attempts":1,"error_code":"provider_unauthorized","...":"..."}}
+```
+
+O sync seguinte nem chama o provedor (`409`):
+
+```json
+{"error":{"code":"reautorizacao_necessaria","message":"o provedor recusou o token desta conexão; envie um token novo em PUT /connections/:id/token"}}
+```
+
+`PUT /connections/:id/token` com `{"access_token":"token-novo"}` reativa (`200`), e o sync seguinte volta a responder `201`:
+
+```json
+{"connection":{"id":"8cebc6cf-...","creator_id":"criadora-1","platform":"tiktok","external_account_id":"ana.cria","rate_limited_until":null,"status":"active","created_at":"2026-10-10T13:07:29.130Z"}}
 ```
 
 ## Entradas recusadas
