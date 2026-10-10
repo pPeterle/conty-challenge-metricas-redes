@@ -17,6 +17,8 @@ npm run typecheck
 npm run load       # sobe provedor (3112) e API (3102), roda k6 no Docker e verifica as invariantes
 ```
 
+Os logs da API e do provedor simulado saem em JSON pelo pino, com transporte em worker thread (`pino/file` no stdout); `LOG_LEVEL` muda o nível (padrão `info`; nos testes o logger é silencioso).
+
 Configuração da API por variável de ambiente. Tudo passa por um schema zod na subida: valor que não é inteiro positivo (por exemplo `abc`, `0` ou `-1`) impede o processo de subir, porque um teto `NaN` desligaria o limite de tentativas.
 
 | Variável | Padrão | O que faz |
@@ -139,7 +141,7 @@ Um erro inesperado no meio do sync (banco falhando, por exemplo) fecha o run com
 
 ## Validação e limites
 
-Toda entrada passa por um schema zod em `src/schemas.ts`: corpo, query, parâmetros de rota, resposta do provedor e variáveis de ambiente. O provedor simulado também valida as próprias rotas. Campo desconhecido é ignorado. Corpo sem `content-type: application/json` recebe 415, JSON quebrado ou vazio recebe 400, e corpo acima de 16 KB recebe 413. Campo inválido recebe 400 com `details` (caminho e motivo de cada problema). As datas precisam de fuso entre -14:00 e +14:00 e passam por conferência de ida e volta (`2026-02-30` e `+24:00` são recusados, inclusive quando vêm do provedor), e as listagens aceitam `limit` de 1 a 200. `external_account_id` é normalizado (sem `@`, minúsculo, sem espaço nas pontas), então `@Ana.Cria` e `ana.cria` são a mesma conexão. Rota ou método inexistente recebe 404 JSON, e erro inesperado recebe 500 JSON sem stack trace.
+Toda entrada passa por um schema zod em `src/schemas.ts`: corpo, query, parâmetros de rota, resposta do provedor e variáveis de ambiente. O provedor simulado também valida as próprias rotas. Campo desconhecido é ignorado. Corpo sem `content-type: application/json` recebe 415, JSON quebrado ou vazio recebe 400, e corpo acima de 16 KB recebe 413. Campo inválido recebe 400 com `details` (caminho e motivo de cada problema). As datas precisam de fuso entre -14:00 e +14:00 e passam por conferência de ida e volta (`2026-02-30` e `+24:00` são recusados, inclusive quando vêm do provedor), e as listagens aceitam `limit` de 1 a 200. `external_account_id` é normalizado (sem `@`, minúsculo, sem espaço nas pontas), então `@Ana.Cria` e `ana.cria` são a mesma conexão. Rota ou método inexistente recebe 404 JSON, e erro inesperado recebe 500 JSON sem stack trace (o erro completo vai para o log).
 
 ## Regras do enunciado e onde estão
 
@@ -211,26 +213,26 @@ Com várias instâncias, eu mudaria nesta ordem:
 
 Depois, `scripts/verify-load.ts` lê o banco e a API e falha se: existir snapshot repetido; algum post tiver mais de um snapshot; algum número gravado divergir do provedor; sobrar sync em `running`; existir conexão além das 20 do setup (um payload inválido teria gravado). Em seguida ele desliga o chaos, faz um sync final de cada conexão e compara os totais de cada conexão e de cada criador com o que o provedor diz.
 
-Resultado real de uma execução nesta máquina, no código final (macOS, k6 0.54.0 no Docker, 2026-10-10, load average perto de 9):
+Resultado real de uma execução nesta máquina, no código final (macOS, k6 0.54.0 no Docker, 2026-10-10, load average perto de 5):
 
 ```
-✓ checks.........................: 100.00% 20676 out of 20676
-✓ { scenario:reads }...........: avg=1.08ms  med=843.69µs p(90)=1.82ms  p(95)=2.58ms
-✓ { scenario:syncs }...........: avg=64.13ms med=1.18ms   p(90)=53.02ms p(95)=168.17ms
-✓ http_req_failed................: 0.00%   0 out of 7575
-  http_reqs......................: 7575    241.96955/s
-✓ invalid_payload_rejected_4xx...: 100.00% 497 out of 497
-  sync_201_succeeded.............: 2032
-  sync_409_em_andamento..........: 1947
-  sync_503_rate_limited..........: 229
-✓ sync_success_rate..............: 99.46%  2032 out of 2043
-provedor durante a carga: {"200":3411,"429":198,"503":407,"requests":4090,"duplicate_items":835,"timeout":74}
-sync_runs: [{"status":"rate_limited","n":11,"attempts":22},{"status":"succeeded","n":2032,"attempts":4068}]
+✓ checks.........................: 100.00% 20522 out of 20522
+✓ { scenario:reads }...........: avg=1.63ms  med=1.27ms   p(90)=2.84ms  p(95)=3.83ms
+✓ { scenario:syncs }...........: avg=66.04ms med=1.78ms   p(90)=54.63ms p(95)=365.98ms
+✓ http_req_failed................: 0.00%   0 out of 7505
+  http_reqs......................: 7505    234.165895/s
+✓ invalid_payload_rejected_4xx...: 100.00% 482 out of 482
+  sync_201_succeeded.............: 2007
+  sync_409_em_andamento..........: 1953
+  sync_503_rate_limited..........: 225
+✓ sync_success_rate..............: 99.45%  2007 out of 2018
+provedor durante a carga: {"200":3415,"429":199,"503":407,"requests":4095,"duplicate_items":836,"timeout":74}
+sync_runs: [{"status":"rate_limited","n":11,"attempts":19},{"status":"succeeded","n":2007,"attempts":4076}]
 conexões: 20, snapshots durante a carga: 600, depois do sync final: 600 snapshots para 600 posts
 verificação ok: nenhum snapshot duplicado, números iguais aos do provedor, totais conferem
 ```
 
-`sync_success_rate` conta só os pedidos que abriram um run: 201 contra 502 e contra 503 que traz `sync_run`. Ficam de fora o 409 (outro sync da conexão em andamento) e o 503 sem run (conexão ainda bloqueada pelo `retry_at`), porque nos dois casos o serviço fez o que devia sem chamar o provedor. Das 229 respostas 503, 11 vieram de runs `rate_limited`; as outras foram recusadas antes de chamar o provedor. 4xx e 503 contam como resposta esperada em `http_req_failed`. Os tetos de latência são folgados de propósito para a carga passar em máquinas mais lentas: p95 abaixo de 5 s nos syncs, que esperam `Retry-After` dentro da requisição, e abaixo de 500 ms nas leituras. Checks, payload inválido recusado (`rate==1`), taxa de sucesso (`> 0.9`) e a verificação no banco continuam rígidos. Antes do índice de um run por conexão, a taxa ficava entre 82,9% e 85,9% porque contava também os 503 sem run; com a definição atual, as execuções ficaram entre 99,43% e 99,46%. O p95 dos syncs oscila bastante entre rodadas: numa rodada anterior no mesmo dia, com load average perto de 17, deu 1 s, porque o percentil cai em cima das esperas de `Retry-After: 1` feitas dentro da requisição.
+`sync_success_rate` conta só os pedidos que abriram um run: 201 contra 502 e contra 503 que traz `sync_run`. Ficam de fora o 409 (outro sync da conexão em andamento) e o 503 sem run (conexão ainda bloqueada pelo `retry_at`), porque nos dois casos o serviço fez o que devia sem chamar o provedor. Das 225 respostas 503, 11 vieram de runs `rate_limited`; as outras foram recusadas antes de chamar o provedor. 4xx e 503 contam como resposta esperada em `http_req_failed`. Os tetos de latência são folgados de propósito para a carga passar em máquinas mais lentas: p95 abaixo de 5 s nos syncs, que esperam `Retry-After` dentro da requisição, e abaixo de 500 ms nas leituras. Checks, payload inválido recusado (`rate==1`), taxa de sucesso (`> 0.9`) e a verificação no banco continuam rígidos. Antes do índice de um run por conexão, a taxa ficava entre 82,9% e 85,9% porque contava também os 503 sem run; com a definição atual, as execuções ficaram entre 99,43% e 99,46%. O p95 dos syncs oscila bastante entre rodadas (de 168 ms a 1 s nas rodadas deste dia), porque o percentil cai perto das esperas de `Retry-After: 1` feitas dentro da requisição. A troca do `console` pelo pino não mudou isso: uma rodada logo antes da troca, nas mesmas condições, deu 242 req/s e mediana de 1,68 ms nos syncs, contra 234 req/s e 1,78 ms depois. A API não registra uma linha por requisição, só a subida, o encerramento e erros inesperados.
 
 ## O que ficou de fora
 

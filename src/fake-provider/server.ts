@@ -1,6 +1,9 @@
 import { serve } from "@hono/node-server";
 import { systemClock, type Clock } from "../clock.ts";
+import { createLogger, flushOnShutdown } from "../logger.ts";
 import { createFakeProviderApp, type ChaosConfig } from "./app.ts";
+
+const logger = createLogger().child({ servico: "provedor-simulado" });
 
 const port = Number(process.env.PROVIDER_PORT ?? 3010);
 
@@ -35,7 +38,8 @@ function seededRandom(seed: number): () => number {
 const seed = process.env.CHAOS_SEED;
 const random = seed ? seededRandom(Number(seed)) : Math.random;
 
-const app = createFakeProviderApp({ clock, chaos, random });
-serve({ fetch: app.fetch, port }, () => {
-  console.log(`provedor simulado em http://localhost:${port}${chaos ? " (chaos ligado)" : ""}`);
+const app = createFakeProviderApp({ clock, chaos, random, logger });
+const server = serve({ fetch: app.fetch, port }, () => {
+  logger.info({ port, chaos: chaos !== null }, `provedor simulado em http://localhost:${port}${chaos ? " (chaos ligado)" : ""}`);
 });
+flushOnShutdown(logger, () => server.close());

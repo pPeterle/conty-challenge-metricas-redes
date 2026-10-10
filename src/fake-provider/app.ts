@@ -2,6 +2,7 @@ import { zValidator } from "@hono/zod-validator";
 import { Hono } from "hono";
 import { z } from "zod";
 import type { Clock } from "../clock.ts";
+import { silentLogger, type Logger } from "../logger.ts";
 import { isExactInstant } from "../schemas.ts";
 import { capturedAtFor, DEFAULT_DATASET, listPosts, metricsAt, type DatasetOptions } from "./dataset.ts";
 
@@ -68,6 +69,8 @@ export interface FakeProviderOptions {
   overlapPages?: boolean;
   chaos?: ChaosConfig | null;
   random?: () => number;
+  /** Padrão: silencioso (testes). */
+  logger?: Logger;
 }
 
 const PLATFORMS = new Set(["instagram", "tiktok", "youtube", "x"]);
@@ -101,6 +104,12 @@ export function createFakeProviderApp(options: FakeProviderOptions) {
   }
 
   const app = new Hono();
+  const logger = options.logger ?? silentLogger;
+  // Sem isto o Hono escreveria o erro com console.error.
+  app.onError((err, c) => {
+    logger.error({ err, method: c.req.method, path: c.req.path }, "erro inesperado no provedor simulado");
+    return c.json({ error: "internal_error" }, 500);
+  });
 
   app.get("/v1/:platform/accounts/:account/posts", zValidator("query", postsQuerySchema, badRequest), async (c) => {
     const { platform, account } = c.req.param();

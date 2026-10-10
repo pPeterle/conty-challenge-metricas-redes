@@ -1,3 +1,4 @@
+import pino from "pino";
 import { describe, expect, it } from "vitest";
 import { createHarness } from "./harness.ts";
 
@@ -206,20 +207,22 @@ describe("rotas, ids e listagens", () => {
     expect(last.body.posts[4].external_post_id).toBe("instagram-conta-a-p001");
   });
 
-  it("erro inesperado vira 500 JSON genérico, sem stack trace", async () => {
-    const h = createHarness();
+  it("erro inesperado vira 500 JSON genérico, sem stack trace, e o erro vai para o logger", async () => {
+    const lines: string[] = [];
+    const logger = pino({ level: "info" }, { write: (line: string) => void lines.push(line) });
+    const h = createHarness({ logger });
     const conn = await h.connect();
     h.db.exec("DROP TABLE sync_attempts");
-    const original = console.error;
-    console.error = () => {};
-    try {
-      const res = await h.sync(conn.id);
-      expect(res.status).toBe(500);
-      expect(res.body).toEqual({ error: { code: "internal_error", message: "erro interno inesperado" } });
-      const run = h.db.prepare("SELECT status, error_code FROM sync_runs").get();
-      expect(run).toEqual({ status: "failed", error_code: "internal_error" });
-    } finally {
-      console.error = original;
-    }
+    const res = await h.sync(conn.id);
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ error: { code: "internal_error", message: "erro interno inesperado" } });
+    const run = h.db.prepare("SELECT status, error_code FROM sync_runs").get();
+    expect(run).toEqual({ status: "failed", error_code: "internal_error" });
+    expect(lines).toHaveLength(1);
+    const entry = JSON.parse(lines[0]!);
+    expect(entry).toMatchObject({ level: 50, msg: "erro inesperado", method: "POST", path: `/connections/${conn.id}/sync` });
+    expect(entry.err.message).toMatch(/sync_attempts/);
+    expect(lines[0]).not.toContain("token-fake");
   });
+
 });

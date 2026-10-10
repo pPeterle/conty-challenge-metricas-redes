@@ -7,6 +7,7 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { ZodError, ZodSchema } from "zod";
 import type { Clock, Sleep } from "./clock.ts";
 import { createRepository, type ConnectionRow, type SyncRunRow } from "./db.ts";
+import { silentLogger, type Logger } from "./logger.ts";
 import type { ProviderClient } from "./provider/types.ts";
 import {
   connectionParamsSchema,
@@ -27,6 +28,8 @@ export interface AppDeps {
   provider: ProviderClient;
   policy: SyncPolicy;
   newId?: () => string;
+  /** Padrão: logger silencioso (testes). O servidor passa o de `createLogger`. */
+  logger?: Logger;
 }
 
 export const DEFAULT_POLICY: SyncPolicy = {
@@ -108,9 +111,10 @@ export function createApp(deps: AppDeps) {
   const sync = new SyncService({ repo, provider: deps.provider, clock: deps.clock, sleep: deps.sleep, policy: deps.policy, newId });
 
   const app = new Hono();
+  const logger = deps.logger ?? silentLogger;
 
   app.onError((err, c) => {
-    console.error(err);
+    logger.error({ err, method: c.req.method, path: c.req.path }, "erro inesperado");
     return fail(c, 500, "internal_error", "erro interno inesperado");
   });
   app.notFound((c) => fail(c, 404, "not_found", "rota não encontrada"));

@@ -5,6 +5,7 @@ import { createFakeProviderApp, type Fault } from "../../src/fake-provider/app.t
 import { HttpProviderClient } from "../../src/provider/http-client.ts";
 import type { ProviderClient } from "../../src/provider/types.ts";
 import type { SyncPolicy } from "../../src/sync-service.ts";
+import type { Logger } from "../../src/logger.ts";
 
 export const START = "2026-10-01T10:15:00.000Z";
 /** Janela que cobre os 30 posts do dataset (publicados de 01/09 a 08/09, um a cada 6h). */
@@ -28,7 +29,7 @@ export const TEST_POLICY: SyncPolicy = {
  * só o transporte é trocado por `providerApp.request`, então não abre porta nenhuma.
  */
 export function createHarness(
-  overrides: { policy?: Partial<SyncPolicy>; timeoutMs?: number; provider?: ProviderClient } = {},
+  overrides: { policy?: Partial<SyncPolicy>; timeoutMs?: number; provider?: ProviderClient; logger?: Logger } = {},
 ) {
   const clock = new ManualClock(START);
   const providerApp = createFakeProviderApp({ clock, pageSize: 10, overlapPages: true });
@@ -48,6 +49,7 @@ export function createHarness(
     sleep: clock.sleep,
     provider: overrides.provider ?? provider,
     policy: { ...TEST_POLICY, ...overrides.policy },
+    logger: overrides.logger,
   };
   const app = createApp(deps);
 

@@ -170,6 +170,7 @@ export const envSchema = z.object({
   SYNC_MAX_RATE_LIMIT_BLOCK_MS: positiveInt(24 * 3600 * 1000),
   SYNC_MAX_PAGES: positiveInt(100),
 });
+export type Env = z.output<typeof envSchema>;
 
 const policyInt = z.number().int().positive().safe();
 export const syncPolicySchema = z

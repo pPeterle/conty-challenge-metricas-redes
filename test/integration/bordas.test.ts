@@ -27,14 +27,8 @@ describe("gravação atômica por página", () => {
     h.db.exec(`CREATE TRIGGER quebra BEFORE INSERT ON metric_snapshots
       WHEN NEW.external_post_id = 'instagram-conta-a-p026'
       BEGIN SELECT RAISE(ABORT, 'falha simulada de disco'); END`);
-    const original = console.error;
-    console.error = () => {};
-    try {
-      const res = await h.sync(conn.id);
-      expect(res.status).toBe(500);
-    } finally {
-      console.error = original;
-    }
+    const res = await h.sync(conn.id);
+    expect(res.status).toBe(500);
 
     expect(count(h, "posts")).toBe(0);
     expect(count(h, "metric_snapshots")).toBe(0);
