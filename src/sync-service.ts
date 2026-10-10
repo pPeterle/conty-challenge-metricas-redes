@@ -56,18 +56,15 @@ export class SyncService {
 
     repo.abandonStaleRuns(connection.id, new Date(now.getTime() - this.deps.policy.staleRunMs).toISOString(), now.toISOString());
 
+    const since = window.since.toISOString();
+    const until = window.until.toISOString();
+    const resume = repo.resumePoint(connection.id, since, until);
     const runId = newId();
-    const busy = repo.startRun({
-      id: runId,
-      connectionId: connection.id,
-      since: window.since.toISOString(),
-      until: window.until.toISOString(),
-      startedAt: now.toISOString(),
-    });
+    const busy = repo.startRun({ id: runId, connectionId: connection.id, since, until, startedAt: now.toISOString(), resumedFrom: resume?.runId });
     if (busy) throw new SyncInProgressError(busy.runningId);
 
     try {
-      return await this.paginate(runId, connection, window);
+      return await this.paginate(runId, connection, window, resume?.cursor ?? null);
     } catch (error) {
       // Não deixa a execução presa em running quando algo inesperado quebra no meio.
       try {
@@ -79,10 +76,10 @@ export class SyncService {
     }
   }
 
-  private async paginate(runId: string, connection: ConnectionRow, window: SyncWindow): Promise<SyncRunRow> {
+  private async paginate(runId: string, connection: ConnectionRow, window: SyncWindow, startCursor: string | null): Promise<SyncRunRow> {
     const { repo, clock } = this.deps;
-    let cursor: string | null = null;
-    const seenCursors = new Set<string>();
+    let cursor: string | null = startCursor;
+    const seenCursors = new Set<string>(startCursor ? [startCursor] : []);
     const budget = { waitedMs: 0, attempts: 0 };
 
     for (let pageNumber = 1; ; pageNumber++) {
@@ -93,7 +90,9 @@ export class SyncService {
       const outcome = await this.fetchPageWithRetry(runId, connection, window, cursor, pageNumber, budget);
       if (!outcome.ok) {
         if (outcome.retryAt) repo.markRateLimited(connection.id, outcome.retryAt);
-        return this.finish(runId, outcome.status, outcome.code, outcome.message, outcome.retryAt);
+        // Parou por limite de taxa no meio: guarda de onde o próximo sync da mesma janela continua.
+        const resumeCursor = outcome.status === "rate_limited" ? cursor : null;
+        return this.finish(runId, outcome.status, outcome.code, outcome.message, outcome.retryAt, resumeCursor);
       }
 
       // fetched_at é o relógio da nossa busca; captured_at vem do provedor dentro de cada post.
@@ -207,13 +206,21 @@ export class SyncService {
     }
   }
 
-  private finish(runId: string, status: SyncRunRow["status"], code?: string, message?: string, retryAt?: string): SyncRunRow {
+  private finish(
+    runId: string,
+    status: SyncRunRow["status"],
+    code?: string,
+    message?: string,
+    retryAt?: string,
+    resumeCursor: string | null = null,
+  ): SyncRunRow {
     this.deps.repo.finishRun(runId, {
       status,
       finishedAt: this.deps.clock.now().toISOString(),
       errorCode: code,
       errorMessage: message,
       retryAt,
+      resumeCursor,
     });
     return this.deps.repo.getRun(runId)!;
   }

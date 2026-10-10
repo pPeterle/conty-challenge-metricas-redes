@@ -66,7 +66,11 @@ CREATE TABLE IF NOT EXISTS sync_runs (
   snapshot_conflicts INTEGER NOT NULL DEFAULT 0,
   error_code TEXT,
   error_message TEXT,
-  retry_at TEXT
+  retry_at TEXT,
+  -- Parou em rate_limited no meio da paginação: cursor da página que faltou, para o próximo
+  -- sync da mesma janela continuar dali.
+  resume_cursor TEXT,
+  resumed_from TEXT
 );
 CREATE INDEX IF NOT EXISTS sync_runs_connection ON sync_runs (connection_id, started_at);
 -- No máximo um sync em andamento por conexão. Run abandonado é fechado antes de abrir o próximo.
@@ -149,6 +153,8 @@ export interface SyncRunRow {
   error_code: string | null;
   error_message: string | null;
   retry_at: string | null;
+  resume_cursor: string | null;
+  resumed_from: string | null;
 }
 
 export interface SyncAttemptRow {
@@ -233,8 +239,13 @@ export function createRepository(db: DatabaseSync) {
        WHERE id = ? AND (rate_limited_until IS NULL OR rate_limited_until < ?)`,
     ),
     insertRun: db.prepare(
-      `INSERT INTO sync_runs (id, connection_id, window_since, window_until, status, started_at)
-       VALUES (?, ?, ?, ?, 'running', ?)`,
+      `INSERT INTO sync_runs (id, connection_id, window_since, window_until, status, started_at, resumed_from)
+       VALUES (?, ?, ?, ?, 'running', ?, ?)`,
+    ),
+    lastFinishedRunForWindow: db.prepare(
+      `SELECT id, status, resume_cursor FROM sync_runs
+       WHERE connection_id = ? AND window_since = ? AND window_until = ? AND status != 'running'
+       ORDER BY started_at DESC, rowid DESC LIMIT 1`,
     ),
     runById: db.prepare(`SELECT * FROM sync_runs WHERE id = ?`),
     runningRun: db.prepare(`SELECT id FROM sync_runs WHERE connection_id = ? AND status = 'running'`),
@@ -284,7 +295,8 @@ export function createRepository(db: DatabaseSync) {
        WHERE id = ?`,
     ),
     finishRun: db.prepare(
-      `UPDATE sync_runs SET status = ?, finished_at = ?, error_code = ?, error_message = ?, retry_at = ?
+      `UPDATE sync_runs SET status = ?, finished_at = ?, error_code = ?, error_message = ?, retry_at = ?,
+         resume_cursor = ?
        WHERE id = ?`,
     ),
     postsWithMetrics: db.prepare(
@@ -358,9 +370,9 @@ export function createRepository(db: DatabaseSync) {
     },
 
     /** Abre o run. Se já existe um em running para a conexão, devolve o id dele e não abre nada. */
-    startRun(input: { id: string; connectionId: string; since: string; until: string; startedAt: string }): { runningId: string } | null {
+    startRun(input: { id: string; connectionId: string; since: string; until: string; startedAt: string; resumedFrom?: string | null }): { runningId: string } | null {
       try {
-        stmts.insertRun.run(input.id, input.connectionId, input.since, input.until, input.startedAt);
+        stmts.insertRun.run(input.id, input.connectionId, input.since, input.until, input.startedAt, input.resumedFrom ?? null);
         return null;
       } catch (error) {
         if (!/UNIQUE constraint failed: sync_runs\.connection_id/.test(String((error as Error).message))) throw error;
@@ -411,8 +423,16 @@ export function createRepository(db: DatabaseSync) {
       });
     },
 
-    finishRun(runId: string, f: { status: SyncStatus; finishedAt: string; errorCode?: string; errorMessage?: string; retryAt?: string }) {
-      stmts.finishRun.run(f.status, f.finishedAt, f.errorCode ?? null, f.errorMessage ?? null, f.retryAt ?? null, runId);
+    finishRun(runId: string, f: { status: SyncStatus; finishedAt: string; errorCode?: string; errorMessage?: string; retryAt?: string; resumeCursor?: string | null }) {
+      stmts.finishRun.run(f.status, f.finishedAt, f.errorCode ?? null, f.errorMessage ?? null, f.retryAt ?? null, f.resumeCursor ?? null, runId);
+    },
+
+    /** Se o último sync desta janela parou por limite de taxa no meio, de onde continuar. */
+    resumePoint(connectionId: string, since: string, until: string): { runId: string; cursor: string } | null {
+      const last = stmts.lastFinishedRunForWindow.get(connectionId, since, until) as
+        | { id: string; status: SyncStatus; resume_cursor: string | null }
+        | undefined;
+      return last?.status === "rate_limited" && last.resume_cursor ? { runId: last.id, cursor: last.resume_cursor } : null;
     },
 
     getRun(id: string): SyncRunRow | undefined {
